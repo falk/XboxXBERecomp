@@ -48,6 +48,9 @@ static bool ParseExit(const toml::node* n, Hook::Exit& e) {
 //   [[function]] at, end  an entry decoded no further than end (exclusive); it also stops other walks
 //   [[switch]] at, targets  the targets of an indirect jmp, replacing table detection
 //   [xbe] xdk = build  includes <--xdk folder>/<build>/layout.toml
+//   [xbe] x87_static_stack = false  keep every x87 stack in ctx (the dynamic X87_ST code); --x87-dynamic does the same
+//   [xbe] x87_static_ratio = 2  the static stack only where x87 instructions are at least this many per call (each call
+//     costs a sync of the locals), 0 for every function whose stack depth is static
 //   [abi] name = ["esi", "stack", ...]  where a [symbols] function takes each API argument when the image does not
 //     use the convention the host declares: a register, or "stack" for the next stack slot, which the callee pops
 static bool LoadConfig(const fs::path& path, Config& cfg, const fs::path& xdk_dir) {
@@ -87,6 +90,8 @@ static bool LoadConfig(const fs::path& path, Config& cfg, const fs::path& xdk_di
     if (auto v = t["xbe"]["partitions"].value<int64_t>()) cfg.partitions = uint32_t(*v);
     if (auto v = t["xbe"]["gap_fill"].value<bool>()) cfg.gap_fill = *v;
     if (auto v = t["xbe"]["pointer_seeds"].value<bool>()) cfg.pointer_seeds = *v;
+    if (auto v = t["xbe"]["x87_static_stack"].value<bool>()) cfg.x87_static_stack = *v;
+    if (auto v = t["xbe"]["x87_static_ratio"].value<double>()) cfg.x87_static_ratio = *v;
     if (auto a = t["xbe"]["code_sections"].as_array())
         for (auto& i : *a)
             if (auto s = i.value<std::string>()) cfg.code_sections.push_back(*s);
@@ -195,23 +200,21 @@ static bool CheckOverrides(const Analysis& an) {
 int main(int argc, char** argv) {
     std::vector<std::string> args;
     fs::path xdk_dir;
-    bool usage = false;
+    bool usage = false, x87_dynamic = false;
     for (int i = 1; i < argc; i++) {
-        if (std::strcmp(argv[i], "--xdk")) args.push_back(argv[i]);
+        if (!std::strcmp(argv[i], "--x87-dynamic")) x87_dynamic = true;
+        else if (std::strcmp(argv[i], "--xdk")) args.push_back(argv[i]);
         else if (++i < argc) xdk_dir = argv[i];
         else usage = true;
     }
     if (args.empty() || usage) {
-        std::fprintf(stderr, "usage: xbe_recomp <config.toml> [xbe override] [out override] [--xdk <SDK xdk folder>]\n");
+        std::fprintf(stderr, "usage: xbe_recomp <config.toml> [xbe override] [out override] [--xdk <SDK xdk folder>] [--x87-dynamic]\n");
         return 1;
     }
     Config cfg;
     fs::path cfg_path = args[0];
     if (!LoadConfig(cfg_path, cfg, xdk_dir)) return 1;
-    if (cfg.library.empty()) {
-        std::fprintf(stderr, "%s: [xbe] needs library = \"<exe>.dll\", the game code DLL the executable loads\n", args[0].c_str());
-        return 1;
-    }
+    if (x87_dynamic) cfg.x87_static_stack = false;
     for (auto& [name, locs] : cfg.abi)
         if (!cfg.symbols.count(name)) {
             std::fprintf(stderr, "%s: [abi] %s is not a [symbols] name\n", args[0].c_str(), name.c_str());

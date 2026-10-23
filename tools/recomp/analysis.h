@@ -40,6 +40,8 @@ struct Config {
     std::vector<std::pair<uint32_t, uint32_t>> data_ranges;  // data inside code sections
     bool gap_fill = true;
     bool pointer_seeds = true;
+    bool x87_static_stack = true;  // st(i) as locals where the stack depth is static (codegen_x87.cpp)
+    double x87_static_ratio = 2;   // ...in functions with at least this many x87 instructions per call (0: all)
     std::multimap<uint32_t, Hook> hooks;
     std::map<uint32_t, uint32_t> function_ends;          // declared entries, exclusive decode limit or 0
     std::map<uint32_t, std::vector<uint32_t>> switches;  // indirect jmp to its targets

@@ -432,6 +432,9 @@ void MarkDirty(uint32_t res) {
     g_dirty[data] = ++g_epoch;
 }
 
+void MortonMasks(uint32_t w, uint32_t h, uint32_t d, uint32_t& mx, uint32_t& my, uint32_t& mz) { SwizzleMasks(w, h, d, mx, my, mz); }
+uint32_t MortonDeposit(uint32_t v, uint32_t mask) { return Deposit(v, mask); }
+
 uint64_t DirtyEpoch(uint32_t data) {
     std::lock_guard<std::mutex> lock(g_dirty_lock);
     auto it = g_dirty.find(data);

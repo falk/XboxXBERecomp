@@ -50,7 +50,9 @@ void LoadPersistedDisplay() {
         head[6] > 1040)
         return;
     uint32_t block = mem::AllocContiguous(0x40 + head[4], 0, 0xFFFFFFFF, 0x1000);
-    if (!block || !f.read(static_cast<char*>(HostPtr(block + 0x40)), head[4])) return;
+    std::vector<char> pixels(head[4]);
+    if (!block || !f.read(pixels.data(), head[4])) return;
+    std::memcpy(HostPtr(block + 0x40), pixels.data(), head[4]);
     g_kept_picture.resize(head[6]);
     if (!f.read(g_kept_picture.data(), head[6])) g_kept_picture.clear();
     W32(block, (head[1] & 0xFFFF0000) | 1);
@@ -68,7 +70,7 @@ void SavePersistedDisplay(uint32_t common, uint32_t format, uint32_t size, const
     if (FILE* f = std::fopen(PersistFile().c_str(), "wb")) {
         uint32_t head[7] = {kPersistMagic, common, format, size, bytes, g_mark, uint32_t(g_picture.size())};
         std::fwrite(head, sizeof head, 1, f);
-        std::fwrite(pixels, 1, bytes, f);
+        mem::FileWrite(pixels, bytes, f);  // guest memory
         std::fwrite(g_picture.data(), 1, g_picture.size(), f);
         std::fclose(f);
     }
@@ -139,7 +141,9 @@ bool Boot(std::vector<uint8_t> xbe, const std::string& xbe_name, const std::stri
     std::ifstream lf(g_launch_file, std::ios::binary);
     if (lf) {
         uint32_t page = mem::AllocContiguous(0x1000, 0, 0xFFFFFFFF, 0x1000);
-        lf.read(static_cast<char*>(HostPtr(page)), 0x1000);
+        char data[0x1000] = {};
+        lf.read(data, sizeof data);
+        std::memcpy(HostPtr(page), data, sizeof data);
         lf.close();
         std::remove(g_launch_file.c_str());
         W32(g_launch_data_page_va, page);
@@ -203,6 +207,10 @@ void Relaunch(const char* exe) {
     } else {
         LOGE("relaunch: cannot start %s.exe (%lu)", exe, GetLastError());
     }
+    std::_Exit(0);
+#elif defined(__SWITCH__)
+    // one NRO holds one image; another xbe would be another NRO, chained through envSetNextLoad
+    LOGE("relaunch: %s is not part of this build", exe);
     std::_Exit(0);
 #else
     char self[4096] = {};

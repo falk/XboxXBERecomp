@@ -31,6 +31,8 @@ static int MmIndex(const ZydisDecodedOperand& o) {
     return -1;
 }
 
+// With the static x87 stack (x87_static_, codegen_x87.cpp) st(i) is a local slot known from the depth, a push or pop
+// only moves the depth, and the control word is the local x87_cw; otherwise the stack is ctx.st at ctx.top.
 bool CodeGen::EmitX87(uint32_t va, const ZydisDecodedInstruction& in, const ZydisDecodedOperand* ops) {
     if (!ZydisMnemonicGetString(in.mnemonic) || ZydisMnemonicGetString(in.mnemonic)[0] != 'f') return false;
     auto m = in.mnemonic;
@@ -51,7 +53,24 @@ bool CodeGen::EmitX87(uint32_t va, const ZydisDecodedInstruction& in, const Zydi
         if (o.size == 64) return "(double)(int64_t)X86_MEM64(ea)";
         return "(double)(int32_t)X86_MEM32(ea)";
     };
-    auto st = [&](int i) { return F("X87_ST(%d)", i); };
+    const bool sx = x87_static_;
+    int& xd = x87_depth_;  // depth as the instruction pushes and pops (static stack); X87Check compares it to the plan
+    // st(i) at the current depth; push and pop move it, so a name is taken before the push or pop it precedes
+    auto st = [&](int i) { return sx ? F("x87_f%d", ((i - xd) % 8 + 8) % 8) : F("X87_ST(%d)", i); };
+    auto push = [&](const std::string& v) -> std::string {
+        if (!sx) return "x87_push(ctx, " + v + ");";
+        xd++;
+        return st(0) + " = " + v + ";";
+    };
+    auto pop = [&]() -> std::string {
+        if (!sx) return " x87_pop(ctx);";
+        xd--;
+        return "";
+    };
+    const char* prec = sx ? "x87_precw(x87_cw, " : "x87_prec(ctx, ";
+    const char* cw = sx ? "x87_cw" : "ctx.fcw";
+    auto top = [&]() { return sx ? F("(x87_T + %du) & 7", ((-xd) % 8 + 8) % 8) : std::string("ctx.top"); };
+    auto status = [&]() { return sx ? "x87_status_top(ctx, " + top() + ")" : std::string("x87_status(ctx)"); };
 
     struct Arith {
         ZydisMnemonic m;
@@ -83,49 +102,62 @@ bool CodeGen::EmitX87(uint32_t va, const ZydisDecodedInstruction& in, const Zydi
             src = st(0);
         }
         std::string expr = a.rev ? "(s " + std::string(a.op) + " d)" : "(d " + std::string(a.op) + " s)";
-        emit(F("double s = %s; double d = %s; %s = x87_prec(ctx, %s);%s", src.c_str(), dst.c_str(), dst.c_str(), expr.c_str(),
-               a.pop ? " x87_pop(ctx);" : ""));
+        std::string p = a.pop ? pop() : "";
+        emit(F("double s = %s; double d = %s; %s = %s%s);%s", src.c_str(), dst.c_str(), dst.c_str(), prec, expr.c_str(), p.c_str()));
         return true;
     }
 
     switch (m) {
         case ZYDIS_MNEMONIC_FLD:
-            if (mi >= 0) emit("x87_push(ctx, " + fmem(ops[mi]) + ");");
-            else emit(F("double v = %s; x87_push(ctx, v);", st(StIndex(ops[0])).c_str()));
+            if (mi >= 0) emit(push(fmem(ops[mi])));
+            else {
+                std::string v = st(StIndex(ops[0]));
+                emit(sx ? push(v) : F("double v = %s; x87_push(ctx, v);", v.c_str()));
+            }
             return true;
         case ZYDIS_MNEMONIC_FILD:
-            emit("x87_push(ctx, " + imem(ops[mi]) + ");");
+            emit(push(imem(ops[mi])));
             return true;
         case ZYDIS_MNEMONIC_FST:
         case ZYDIS_MNEMONIC_FSTP: {
-            const char* pop = m == ZYDIS_MNEMONIC_FSTP ? " x87_pop(ctx);" : "";
+            std::string s0 = st(0);
             if (mi >= 0) {
                 auto& o = ops[mi];
-                if (o.size == 32) emit(F("X86_MEMF32(ea) = (float)X87_ST(0);%s", pop));
-                else if (o.size == 64) emit(F("X86_MEMF64(ea) = X87_ST(0);%s", pop));
-                else emit(F("x87_store80(X86_PTR(uint8_t, ea), X87_ST(0));%s", pop));
+                std::string pop_ = m == ZYDIS_MNEMONIC_FSTP ? pop() : "";
+                if (o.size == 32) emit(F("X86_MEMF32(ea) = (float)%s;%s", s0.c_str(), pop_.c_str()));
+                else if (o.size == 64) emit(F("X86_MEMF64(ea) = %s;%s", s0.c_str(), pop_.c_str()));
+                else emit(F("x87_store80(X86_PTR(uint8_t, ea), %s);%s", s0.c_str(), pop_.c_str()));
             } else {
-                emit(F("%s = X87_ST(0);%s", st(StIndex(ops[0])).c_str(), pop));
+                std::string si = st(StIndex(ops[0]));
+                std::string pop_ = m == ZYDIS_MNEMONIC_FSTP ? pop() : "";
+                emit(F("%s = %s;%s", si.c_str(), s0.c_str(), pop_.c_str()));
             }
             return true;
         }
         case ZYDIS_MNEMONIC_FIST:
         case ZYDIS_MNEMONIC_FISTP:
         case ZYDIS_MNEMONIC_FISTTP: {
-            const char* pop = m != ZYDIS_MNEMONIC_FIST ? " x87_pop(ctx);" : "";
             auto& o = ops[mi];
-            std::string v = m == ZYDIS_MNEMONIC_FISTTP ? "std::trunc(X87_ST(0))" : "X87_ST(0)";
-            // fcw 0xC00 sets rounding to truncate for the store
-            std::string pre = m == ZYDIS_MNEMONIC_FISTTP ? "uint16_t cw = ctx.fcw; ctx.fcw |= 0xC00; " : "";
-            std::string post = m == ZYDIS_MNEMONIC_FISTTP ? " ctx.fcw = cw;" : "";
-            if (o.size == 16) emit(pre + "X86_MEM16(ea) = (uint16_t)x87_to_i16(ctx, " + v + ");" + post + pop);
-            else if (o.size == 64) emit(pre + "X86_MEM64(ea) = (uint64_t)x87_to_i64(ctx, " + v + ");" + post + pop);
-            else emit(pre + "X86_MEM32(ea) = (uint32_t)x87_to_i32(ctx, " + v + ");" + post + pop);
+            std::string s0 = st(0);
+            std::string pop_ = m != ZYDIS_MNEMONIC_FIST ? pop() : "";
+            std::string v = m == ZYDIS_MNEMONIC_FISTTP ? "std::trunc(" + s0 + ")" : s0;
+            const char* bits = o.size == 16 ? "16" : o.size == 64 ? "64" : "32";
+            std::string store = F("X86_MEM%s(ea) = (uint%s_t)", bits, bits);
+            if (sx) {
+                // fcw 0xC00 sets rounding to truncate for the store
+                std::string c = m == ZYDIS_MNEMONIC_FISTTP ? "x87_cw | 0xC00" : "x87_cw";
+                emit(F("%sx87_to_i%s_cw(%s, %s);", store.c_str(), bits, c.c_str(), v.c_str()) + pop_);
+            } else {
+                std::string pre = m == ZYDIS_MNEMONIC_FISTTP ? "uint16_t cw = ctx.fcw; ctx.fcw |= 0xC00; " : "";
+                std::string post = m == ZYDIS_MNEMONIC_FISTTP ? " ctx.fcw = cw;" : "";
+                emit(pre + F("%sx87_to_i%s(ctx, %s);", store.c_str(), bits, v.c_str()) + post + pop_);
+            }
             return true;
         }
         case ZYDIS_MNEMONIC_FXCH: {
             int i = vis ? StIndex(ops[0]) : 1;
-            emit(F("double t = X87_ST(0); X87_ST(0) = %s; %s = t;", st(i).c_str(), st(i).c_str()));
+            std::string s0 = st(0), si = st(i);
+            emit(F("double t = %s; %s = %s; %s = t;", s0.c_str(), s0.c_str(), si.c_str(), si.c_str()));
             return true;
         }
         case ZYDIS_MNEMONIC_FCOM:
@@ -134,106 +166,145 @@ bool CodeGen::EmitX87(uint32_t va, const ZydisDecodedInstruction& in, const Zydi
         case ZYDIS_MNEMONIC_FUCOMP:
         case ZYDIS_MNEMONIC_FICOM:
         case ZYDIS_MNEMONIC_FICOMP: {
-            bool pop = m == ZYDIS_MNEMONIC_FCOMP || m == ZYDIS_MNEMONIC_FUCOMP || m == ZYDIS_MNEMONIC_FICOMP;
+            bool p = m == ZYDIS_MNEMONIC_FCOMP || m == ZYDIS_MNEMONIC_FUCOMP || m == ZYDIS_MNEMONIC_FICOMP;
             bool integer = m == ZYDIS_MNEMONIC_FICOM || m == ZYDIS_MNEMONIC_FICOMP;
             std::string src = mi >= 0 ? (integer ? imem(ops[mi]) : fmem(ops[mi])) : vis ? st(StIndex(ops[0])) : st(1);
-            emit(F("x87_compare(ctx, X87_ST(0), %s);%s", src.c_str(), pop ? " x87_pop(ctx);" : ""));
+            std::string s0 = st(0);
+            std::string pop_ = p ? pop() : "";
+            emit(F("x87_compare(ctx, %s, %s);%s", s0.c_str(), src.c_str(), pop_.c_str()));
             return true;
         }
         case ZYDIS_MNEMONIC_FCOMPP:
-        case ZYDIS_MNEMONIC_FUCOMPP:
-            emit("x87_compare(ctx, X87_ST(0), X87_ST(1)); x87_pop(ctx); x87_pop(ctx);");
+        case ZYDIS_MNEMONIC_FUCOMPP: {
+            std::string s0 = st(0), s1 = st(1);
+            std::string p1 = pop(), p2 = pop();
+            emit(F("x87_compare(ctx, %s, %s);%s%s", s0.c_str(), s1.c_str(), p1.c_str(), p2.c_str()));
             return true;
+        }
         case ZYDIS_MNEMONIC_FCOMI:
         case ZYDIS_MNEMONIC_FCOMIP:
         case ZYDIS_MNEMONIC_FUCOMI:
         case ZYDIS_MNEMONIC_FUCOMIP: {
-            bool pop = m == ZYDIS_MNEMONIC_FCOMIP || m == ZYDIS_MNEMONIC_FUCOMIP;
-            emit(F("double a = X87_ST(0), b = %s; bool u = a != a || b != b; zf = u || a == b; pf = u; cf = u || a < b; of = 0; sf = 0;%s",
-                   st(StIndex(ops[1])).c_str(), pop ? " x87_pop(ctx);" : ""));
+            bool p = m == ZYDIS_MNEMONIC_FCOMIP || m == ZYDIS_MNEMONIC_FUCOMIP;
+            std::string s0 = st(0), si = st(StIndex(ops[1]));
+            std::string pop_ = p ? pop() : "";
+            emit(F("double a = %s, b = %s; bool u = a != a || b != b; zf = u || a == b; pf = u; cf = u || a < b; of = 0; sf = 0;%s",
+                   s0.c_str(), si.c_str(), pop_.c_str()));
             return true;
         }
         case ZYDIS_MNEMONIC_FTST:
-            emit("x87_compare(ctx, X87_ST(0), 0.0);");
+            emit("x87_compare(ctx, " + st(0) + ", 0.0);");
             return true;
         case ZYDIS_MNEMONIC_FXAM:
-            emit("x87_examine(ctx);");
+            emit(sx ? "x87_examine_v(ctx, " + st(0) + ");" : std::string("x87_examine(ctx);"));
             return true;
-        case ZYDIS_MNEMONIC_FCHS: emit("X87_ST(0) = -X87_ST(0);"); return true;
-        case ZYDIS_MNEMONIC_FABS: emit("X87_ST(0) = std::fabs(X87_ST(0));"); return true;
-        case ZYDIS_MNEMONIC_FSQRT: emit("X87_ST(0) = x87_prec(ctx, std::sqrt(X87_ST(0)));"); return true;
+        case ZYDIS_MNEMONIC_FCHS: emit(F("%s = -%s;", st(0).c_str(), st(0).c_str())); return true;
+        case ZYDIS_MNEMONIC_FABS: emit(F("%s = std::fabs(%s);", st(0).c_str(), st(0).c_str())); return true;
+        case ZYDIS_MNEMONIC_FSQRT: emit(F("%s = %sstd::sqrt(%s));", st(0).c_str(), prec, st(0).c_str())); return true;
         // clearing C2 (0x400) reports the argument in range
-        case ZYDIS_MNEMONIC_FSIN: emit("X87_ST(0) = std::sin(X87_ST(0)); ctx.fsw &= ~0x400;"); return true;
-        case ZYDIS_MNEMONIC_FCOS: emit("X87_ST(0) = std::cos(X87_ST(0)); ctx.fsw &= ~0x400;"); return true;
-        case ZYDIS_MNEMONIC_FSINCOS:
-            emit("double v = X87_ST(0); X87_ST(0) = std::sin(v); x87_push(ctx, std::cos(v)); ctx.fsw &= ~0x400;");
+        case ZYDIS_MNEMONIC_FSIN: emit(F("%s = std::sin(%s); ctx.fsw &= ~0x400;", st(0).c_str(), st(0).c_str())); return true;
+        case ZYDIS_MNEMONIC_FCOS: emit(F("%s = std::cos(%s); ctx.fsw &= ~0x400;", st(0).c_str(), st(0).c_str())); return true;
+        case ZYDIS_MNEMONIC_FSINCOS: {
+            std::string s0 = st(0);
+            std::string p = push("std::cos(v)");
+            emit(F("double v = %s; %s = std::sin(v); %s ctx.fsw &= ~0x400;", s0.c_str(), s0.c_str(), p.c_str()));
             return true;
-        case ZYDIS_MNEMONIC_FPTAN:
-            emit("X87_ST(0) = std::tan(X87_ST(0)); x87_push(ctx, 1.0); ctx.fsw &= ~0x400;");
+        }
+        case ZYDIS_MNEMONIC_FPTAN: {
+            std::string s0 = st(0);
+            std::string p = push("1.0");
+            emit(F("%s = std::tan(%s); %s ctx.fsw &= ~0x400;", s0.c_str(), s0.c_str(), p.c_str()));
             return true;
+        }
         case ZYDIS_MNEMONIC_FPATAN:
-            emit("double v = std::atan2(X87_ST(1), X87_ST(0)); x87_pop(ctx); X87_ST(0) = v;");
-            return true;
-        case ZYDIS_MNEMONIC_F2XM1: emit("X87_ST(0) = std::exp2(X87_ST(0)) - 1.0;"); return true;
         case ZYDIS_MNEMONIC_FYL2X:
-            emit("double v = X87_ST(1) * std::log2(X87_ST(0)); x87_pop(ctx); X87_ST(0) = v;");
+        case ZYDIS_MNEMONIC_FYL2XP1: {
+            std::string s0 = st(0), s1 = st(1);
+            std::string e = m == ZYDIS_MNEMONIC_FPATAN ? F("std::atan2(%s, %s)", s1.c_str(), s0.c_str())
+                          : m == ZYDIS_MNEMONIC_FYL2X ? F("%s * std::log2(%s)", s1.c_str(), s0.c_str())
+                                                      : F("%s * std::log2(%s + 1.0)", s1.c_str(), s0.c_str());
+            std::string p = pop();
+            emit(F("double v = %s;%s %s = v;", e.c_str(), p.c_str(), st(0).c_str()));
             return true;
-        case ZYDIS_MNEMONIC_FYL2XP1:
-            emit("double v = X87_ST(1) * std::log2(X87_ST(0) + 1.0); x87_pop(ctx); X87_ST(0) = v;");
-            return true;
+        }
+        case ZYDIS_MNEMONIC_F2XM1: emit(F("%s = std::exp2(%s) - 1.0;", st(0).c_str(), st(0).c_str())); return true;
         case ZYDIS_MNEMONIC_FSCALE:
-            emit("X87_ST(0) = std::ldexp(X87_ST(0), (int)std::trunc(X87_ST(1)));");
+            emit(F("%s = std::ldexp(%s, (int)std::trunc(%s));", st(0).c_str(), st(0).c_str(), st(1).c_str()));
             return true;
-        case ZYDIS_MNEMONIC_FRNDINT: emit("X87_ST(0) = x87_round(ctx, X87_ST(0));"); return true;
+        case ZYDIS_MNEMONIC_FRNDINT:
+            emit(sx ? F("%s = x87_round_cw(x87_cw, %s);", st(0).c_str(), st(0).c_str())
+                    : F("%s = x87_round(ctx, %s);", st(0).c_str(), st(0).c_str()));
+            return true;
         case ZYDIS_MNEMONIC_FPREM:
-            emit("X87_ST(0) = std::fmod(X87_ST(0), X87_ST(1)); ctx.fsw &= ~0x400;");
+            emit(F("%s = std::fmod(%s, %s); ctx.fsw &= ~0x400;", st(0).c_str(), st(0).c_str(), st(1).c_str()));
             return true;
         case ZYDIS_MNEMONIC_FPREM1:
-            emit("X87_ST(0) = std::remainder(X87_ST(0), X87_ST(1)); ctx.fsw &= ~0x400;");
+            emit(F("%s = std::remainder(%s, %s); ctx.fsw &= ~0x400;", st(0).c_str(), st(0).c_str(), st(1).c_str()));
             return true;
-        case ZYDIS_MNEMONIC_FXTRACT:
-            emit("int e; double v = X87_ST(0); double mnt = std::frexp(v, &e); X87_ST(0) = (double)(e - 1); x87_push(ctx, mnt * 2.0);");
+        case ZYDIS_MNEMONIC_FXTRACT: {
+            std::string s0 = st(0);
+            std::string p = push("mnt * 2.0");
+            emit(F("int e; double v = %s; double mnt = std::frexp(v, &e); %s = (double)(e - 1); %s", s0.c_str(), s0.c_str(), p.c_str()));
             return true;
-        case ZYDIS_MNEMONIC_FLD1: emit("x87_push(ctx, 1.0);"); return true;
-        case ZYDIS_MNEMONIC_FLDZ: emit("x87_push(ctx, 0.0);"); return true;
-        case ZYDIS_MNEMONIC_FLDPI: emit("x87_push(ctx, 3.14159265358979323846);"); return true;
-        case ZYDIS_MNEMONIC_FLDL2E: emit("x87_push(ctx, 1.44269504088896340736);"); return true;
-        case ZYDIS_MNEMONIC_FLDL2T: emit("x87_push(ctx, 3.32192809488736234787);"); return true;
-        case ZYDIS_MNEMONIC_FLDLN2: emit("x87_push(ctx, 0.693147180559945309417);"); return true;
-        case ZYDIS_MNEMONIC_FLDLG2: emit("x87_push(ctx, 0.301029995663981195214);"); return true;
-        case ZYDIS_MNEMONIC_FLDCW: emit("ctx.fcw = X86_MEM16(ea);"); return true;
-        case ZYDIS_MNEMONIC_FNSTCW: emit("X86_MEM16(ea) = ctx.fcw;"); return true;
+        }
+        case ZYDIS_MNEMONIC_FLD1: emit(push("1.0")); return true;
+        case ZYDIS_MNEMONIC_FLDZ: emit(push("0.0")); return true;
+        case ZYDIS_MNEMONIC_FLDPI: emit(push("3.14159265358979323846")); return true;
+        case ZYDIS_MNEMONIC_FLDL2E: emit(push("1.44269504088896340736")); return true;
+        case ZYDIS_MNEMONIC_FLDL2T: emit(push("3.32192809488736234787")); return true;
+        case ZYDIS_MNEMONIC_FLDLN2: emit(push("0.693147180559945309417")); return true;
+        case ZYDIS_MNEMONIC_FLDLG2: emit(push("0.301029995663981195214")); return true;
+        case ZYDIS_MNEMONIC_FLDCW: emit(F("%s = X86_MEM16(ea);", cw)); return true;
+        case ZYDIS_MNEMONIC_FNSTCW: emit(F("X86_MEM16(ea) = %s;", cw)); return true;
         case ZYDIS_MNEMONIC_FNSTSW:
-            if (mi >= 0) emit("X86_MEM16(ea) = x87_status(ctx);");
-            else emit("ctx.eax = (ctx.eax & 0xFFFF0000u) | x87_status(ctx);");
+            if (mi >= 0) emit("X86_MEM16(ea) = " + status() + ";");
+            else emit("ctx.eax = (ctx.eax & 0xFFFF0000u) | " + status() + ";");
             return true;
-        case ZYDIS_MNEMONIC_FNINIT: emit("ctx.fcw = 0x37F; ctx.fsw = 0; ctx.top = 0;"); return true;  // 0x37F is the power on control word
         case ZYDIS_MNEMONIC_FNCLEX: emit("ctx.fsw &= 0x7F00;"); return true;  // keeps condition codes and TOP
         case ZYDIS_MNEMONIC_FFREE: return true;
-        case ZYDIS_MNEMONIC_FINCSTP: emit("ctx.top = (ctx.top + 1) & 7;"); return true;
-        case ZYDIS_MNEMONIC_FDECSTP: emit("ctx.top = (ctx.top - 1) & 7;"); return true;
+        case ZYDIS_MNEMONIC_FINCSTP:
+            if (sx) pop();
+            else emit("ctx.top = (ctx.top + 1) & 7;");
+            return true;
+        case ZYDIS_MNEMONIC_FDECSTP:
+            if (sx) xd++;
+            else emit("ctx.top = (ctx.top - 1) & 7;");
+            return true;
         case ZYDIS_MNEMONIC_FCMOVB: case ZYDIS_MNEMONIC_FCMOVBE: case ZYDIS_MNEMONIC_FCMOVE: case ZYDIS_MNEMONIC_FCMOVNB:
         case ZYDIS_MNEMONIC_FCMOVNBE: case ZYDIS_MNEMONIC_FCMOVNE: case ZYDIS_MNEMONIC_FCMOVNU: case ZYDIS_MNEMONIC_FCMOVU: {
             bool saved = pending_.valid;
             pending_.valid = false;
             std::string c = Cond(m);
             pending_.valid = saved;
-            emit(F("if (%s) X87_ST(0) = %s;", c.c_str(), st(StIndex(ops[1])).c_str()));
+            emit(F("if (%s) %s = %s;", c.c_str(), st(0).c_str(), st(StIndex(ops[1])).c_str()));
             return true;
         }
         case ZYDIS_MNEMONIC_FNSTENV:
         case ZYDIS_MNEMONIC_FNSAVE:
-            emit("X86_MEM32(ea) = ctx.fcw; X86_MEM32(ea + 4) = x87_status(ctx); X86_MEM32(ea + 8) = 0xFFFF;");
+            emit(F("X86_MEM32(ea) = %s; X86_MEM32(ea + 4) = %s; X86_MEM32(ea + 8) = 0xFFFF;", cw, status().c_str()));
             return true;
+        // these set TOP: with the static stack the locals go to ctx first and come back after (the plan's rebase)
+        case ZYDIS_MNEMONIC_FNINIT:  // 0x37F is the power on control word
         case ZYDIS_MNEMONIC_FLDENV:
-        case ZYDIS_MNEMONIC_FRSTOR:
-            emit("ctx.fcw = (uint16_t)X86_MEM32(ea); ctx.fsw = (uint16_t)X86_MEM32(ea + 4); ctx.top = (ctx.fsw >> 11) & 7;");
+        case ZYDIS_MNEMONIC_FRSTOR: {
+            std::string op = m == ZYDIS_MNEMONIC_FNINIT ? "ctx.fcw = 0x37F; ctx.fsw = 0; ctx.top = 0;"
+                : "ctx.fcw = (uint16_t)X86_MEM32(ea); ctx.fsw = (uint16_t)X86_MEM32(ea + 4); ctx.top = (ctx.fsw >> 11) & 7;";
+            if (sx) {
+                auto it = x87_.find(va);
+                op = X87Out() + op + " " + X87In(it->second.out);
+                xd = it->second.out;
+            }
+            emit(op);
             return true;
+        }
         default:
             return false;
     }
 }
 
+// SSE registers are vector locals of the function (x86_v4u x86_xmmN, see PromoteRegs): lanes are read and written as
+// uint32 elements, float lanes through x86_f/x86_u bit casts, the 64 bit halves through x86_q/x86_setq. Packed
+// arithmetic is one vector operation, lane for lane the same IEEE operation with the operands in the same order.
 bool CodeGen::EmitSse(uint32_t va, const ZydisDecodedInstruction& in, const ZydisDecodedOperand* ops) {
     auto m = in.mnemonic;
     int mi = -1;
@@ -243,23 +314,19 @@ bool CodeGen::EmitSse(uint32_t va, const ZydisDecodedInstruction& in, const Zydi
     auto emit = [&](const std::string& s) { Line(open + s + " }"); };
     int d = XmmIndex(ops[0]);
     int s = in.operand_count_visible > 1 ? XmmIndex(ops[1]) : -1;
-    // 128 bit source as an X86Xmm expression
-    auto src128 = [&]() -> std::string {
-        if (s >= 0) return F("ctx.xmm[%d]", s);
-        return "*X86_PTR(X86Xmm, ea)";
-    };
-    auto srcf0 = [&]() -> std::string {
-        if (s >= 0) return F("ctx.xmm[%d].f[0]", s);
-        return "X86_MEMF32(ea)";
-    };
+    auto X = [](int i) { return F("x86_xmm%d", i); };
+    std::string D = d >= 0 ? X(d) : "";
+    // 128 bit source as an x86_v4u expression
+    auto src128 = [&]() -> std::string { return s >= 0 ? X(s) : std::string("X86_LD128(ea)"); };
+    auto srcf0 = [&]() -> std::string { return s >= 0 ? F("x86_f(%s[0])", X(s).c_str()) : std::string("X86_MEMF32(ea)"); };
     struct Bin {
         ZydisMnemonic ps, ss;
         const char* expr;
     };
     static const Bin bins[] = {
-        {ZYDIS_MNEMONIC_ADDPS, ZYDIS_MNEMONIC_ADDSS, "a + b"},
-        {ZYDIS_MNEMONIC_SUBPS, ZYDIS_MNEMONIC_SUBSS, "a - b"},
-        {ZYDIS_MNEMONIC_MULPS, ZYDIS_MNEMONIC_MULSS, "a * b"},
+        {ZYDIS_MNEMONIC_ADDPS, ZYDIS_MNEMONIC_ADDSS, "x86_addss(a, b)"},
+        {ZYDIS_MNEMONIC_SUBPS, ZYDIS_MNEMONIC_SUBSS, "x86_subss(a, b)"},
+        {ZYDIS_MNEMONIC_MULPS, ZYDIS_MNEMONIC_MULSS, "x86_mulss(a, b)"},
         {ZYDIS_MNEMONIC_DIVPS, ZYDIS_MNEMONIC_DIVSS, "a / b"},
         {ZYDIS_MNEMONIC_MINPS, ZYDIS_MNEMONIC_MINSS, "sse_min(a, b)"},
         {ZYDIS_MNEMONIC_MAXPS, ZYDIS_MNEMONIC_MAXSS, "sse_max(a, b)"},
@@ -269,12 +336,30 @@ bool CodeGen::EmitSse(uint32_t va, const ZydisDecodedInstruction& in, const Zydi
     };
     for (auto& b : bins) {
         if (m == b.ps) {
-            emit(F("X86Xmm v = %s; for (int i = 0; i < 4; i++) { float a = ctx.xmm[%d].f[i], b = v.f[i]; (void)a; ctx.xmm[%d].f[i] = %s; }",
-                   src128().c_str(), d, d, b.expr));
+            // add, sub and mul keep the operand order (the NaN a lane ends with), divide cannot be reordered
+            const char* fn = m == ZYDIS_MNEMONIC_ADDPS ? "x86_addps" : m == ZYDIS_MNEMONIC_SUBPS ? "x86_subps"
+                           : m == ZYDIS_MNEMONIC_MULPS ? "x86_mulps" : nullptr;
+            // results that are denormal flush to zero under MXCSR.FZ (x86_fz, the thread's mask)
+            if (fn)
+                emit(F("x86_v4u v = %s; %s = x86_ftz(%s(%s, v), x86_fz);", src128().c_str(), D.c_str(), fn, D.c_str()));
+            else if (m == ZYDIS_MNEMONIC_DIVPS)
+                emit(F("x86_v4u v = %s; %s = x86_ftz((x86_v4u)((x86_v4f)%s / (x86_v4f)v), x86_fz);", src128().c_str(), D.c_str(), D.c_str()));
+            else if (m == ZYDIS_MNEMONIC_RCPPS)  // the approximation flushes tiny results whatever FZ says
+                emit(F("x86_v4u v = %s; for (int i = 0; i < 4; i++) %s[i] = x86_u(x86_ftzs(1.0f / x86_f(v[i]), 0x7FFFFFFFu));", src128().c_str(), D.c_str()));
+            else if (m == ZYDIS_MNEMONIC_MINPS || m == ZYDIS_MNEMONIC_MAXPS)
+                emit(F("x86_v4u v = %s; %s = x86_%s(%s, v);", src128().c_str(), D.c_str(), m == ZYDIS_MNEMONIC_MINPS ? "minps" : "maxps",
+                       D.c_str()));
+            else
+                emit(F("x86_v4u v = %s; for (int i = 0; i < 4; i++) { float a = x86_f(%s[i]), b = x86_f(v[i]); (void)a; %s[i] = x86_u(%s); }",
+                       src128().c_str(), D.c_str(), D.c_str(), b.expr));
             return true;
         }
         if (m == b.ss) {
-            emit(F("float a = ctx.xmm[%d].f[0], b = %s; (void)a; ctx.xmm[%d].f[0] = %s;", d, srcf0().c_str(), d, b.expr));
+            // add, sub, mul and div flush a denormal result under MXCSR.FZ; rcpss flushes it always; min, max, sqrt and
+            // rsqrt cannot make one from these operands (min and max return an operand as it is)
+            bool arith = m == ZYDIS_MNEMONIC_ADDSS || m == ZYDIS_MNEMONIC_SUBSS || m == ZYDIS_MNEMONIC_MULSS || m == ZYDIS_MNEMONIC_DIVSS;
+            std::string e = arith ? F("x86_ftzs(%s, x86_fz)", b.expr) : m == ZYDIS_MNEMONIC_RCPSS ? F("x86_ftzs(%s, 0x7FFFFFFFu)", b.expr) : b.expr;
+            emit(F("float a = x86_f(%s[0]), b = %s; (void)a; %s[0] = x86_u(%s);", D.c_str(), srcf0().c_str(), D.c_str(), e.c_str()));
             return true;
         }
     }
@@ -286,86 +371,85 @@ bool CodeGen::EmitSse(uint32_t va, const ZydisDecodedInstruction& in, const Zydi
         case ZYDIS_MNEMONIC_MOVUPD:
         case ZYDIS_MNEMONIC_MOVDQA:
         case ZYDIS_MNEMONIC_MOVDQU:
-            if (d >= 0) emit(F("ctx.xmm[%d] = %s;", d, src128().c_str()));
-            else emit(F("*X86_PTR(X86Xmm, ea) = ctx.xmm[%d];", s));
+            if (d >= 0) emit(F("%s = %s;", D.c_str(), src128().c_str()));
+            else emit(F("X86_ST128(ea, %s);", X(s).c_str()));
             return true;
         case ZYDIS_MNEMONIC_MOVSS:
-            if (d >= 0 && s >= 0) emit(F("ctx.xmm[%d].f[0] = ctx.xmm[%d].f[0];", d, s));
-            else if (d >= 0) emit(F("ctx.xmm[%d].u[0] = X86_MEM32(ea); ctx.xmm[%d].u[1] = ctx.xmm[%d].u[2] = ctx.xmm[%d].u[3] = 0;", d, d, d, d));
-            else emit(F("X86_MEM32(ea) = ctx.xmm[%d].u[0];", s));
+            if (d >= 0 && s >= 0) emit(F("%s[0] = %s[0];", D.c_str(), X(s).c_str()));
+            else if (d >= 0) emit(F("%s = (x86_v4u){X86_MEM32(ea), 0u, 0u, 0u};", D.c_str()));
+            else emit(F("X86_MEM32(ea) = %s[0];", X(s).c_str()));
             return true;
         case ZYDIS_MNEMONIC_MOVLPS:
-            if (d >= 0) emit(F("ctx.xmm[%d].q[0] = X86_MEM64(ea);", d));
-            else emit(F("X86_MEM64(ea) = ctx.xmm[%d].q[0];", s));
+            if (d >= 0) emit(F("%s = x86_setq(%s, 0, X86_MEM64(ea));", D.c_str(), D.c_str()));
+            else emit(F("X86_MEM64(ea) = x86_q(%s, 0);", X(s).c_str()));
             return true;
         case ZYDIS_MNEMONIC_MOVHPS:
-            if (d >= 0) emit(F("ctx.xmm[%d].q[1] = X86_MEM64(ea);", d));
-            else emit(F("X86_MEM64(ea) = ctx.xmm[%d].q[1];", s));
+            if (d >= 0) emit(F("%s = x86_setq(%s, 1, X86_MEM64(ea));", D.c_str(), D.c_str()));
+            else emit(F("X86_MEM64(ea) = x86_q(%s, 1);", X(s).c_str()));
             return true;
-        case ZYDIS_MNEMONIC_MOVLHPS: emit(F("ctx.xmm[%d].q[1] = ctx.xmm[%d].q[0];", d, s)); return true;
-        case ZYDIS_MNEMONIC_MOVHLPS: emit(F("ctx.xmm[%d].q[0] = ctx.xmm[%d].q[1];", d, s)); return true;
+        case ZYDIS_MNEMONIC_MOVLHPS: emit(F("%s = x86_setq(%s, 1, x86_q(%s, 0));", D.c_str(), D.c_str(), X(s).c_str())); return true;
+        case ZYDIS_MNEMONIC_MOVHLPS: emit(F("%s = x86_setq(%s, 0, x86_q(%s, 1));", D.c_str(), D.c_str(), X(s).c_str())); return true;
         case ZYDIS_MNEMONIC_ANDPS:
         case ZYDIS_MNEMONIC_ANDNPS:
         case ZYDIS_MNEMONIC_ORPS:
         case ZYDIS_MNEMONIC_XORPS: {
             const char* e = m == ZYDIS_MNEMONIC_ANDPS ? "a & b" : m == ZYDIS_MNEMONIC_ANDNPS ? "~a & b" : m == ZYDIS_MNEMONIC_ORPS ? "a | b" : "a ^ b";
-            emit(F("X86Xmm v = %s; for (int i = 0; i < 4; i++) { uint32_t a = ctx.xmm[%d].u[i], b = v.u[i]; ctx.xmm[%d].u[i] = %s; }",
-                   src128().c_str(), d, d, e));
+            emit(F("x86_v4u a = %s, b = %s; %s = %s;", D.c_str(), src128().c_str(), D.c_str(), e));
             return true;
         }
         case ZYDIS_MNEMONIC_CMPPS:
-            emit(F("X86Xmm v = %s; for (int i = 0; i < 4; i++) ctx.xmm[%d].u[i] = sse_cmp(ctx.xmm[%d].f[i], v.f[i], %d);",
-                   src128().c_str(), d, d, int(ops[2].imm.value.u)));
+            emit(F("x86_v4u v = %s; %s = x86_cmpps(%s, v, %d);", src128().c_str(), D.c_str(), D.c_str(), int(ops[2].imm.value.u)));
             return true;
         case ZYDIS_MNEMONIC_CMPSS:
-            emit(F("ctx.xmm[%d].u[0] = sse_cmp(ctx.xmm[%d].f[0], %s, %d);", d, d, srcf0().c_str(), int(ops[2].imm.value.u)));
+            emit(F("%s[0] = sse_cmp(x86_f(%s[0]), %s, %d);", D.c_str(), D.c_str(), srcf0().c_str(), int(ops[2].imm.value.u)));
             return true;
         case ZYDIS_MNEMONIC_COMISS:
         case ZYDIS_MNEMONIC_UCOMISS:
-            emit(F("float a = ctx.xmm[%d].f[0], b = %s; bool u = a != a || b != b; zf = u || a == b; pf = u; cf = u || a < b; of = 0; sf = 0;",
-                   d, srcf0().c_str()));
+            emit(F("float a = x86_f(%s[0]), b = %s; fa = a; fb = b; bool u = a != a || b != b; zf = u || a == b; pf = u; cf = u || a < b; of = 0; sf = 0;",
+                   D.c_str(), srcf0().c_str()));
+            pending_ = {true, false, 32, true};
             return true;
         case ZYDIS_MNEMONIC_CVTSI2SS:
-            emit(F("ctx.xmm[%d].f[0] = (float)(int32_t)%s;", d, Read(ops[1], "ea").c_str()));
+            emit(F("%s[0] = x86_u((float)(int32_t)%s);", D.c_str(), Read(ops[1], "ea").c_str()));
             return true;
         case ZYDIS_MNEMONIC_CVTSS2SI:
-            emit(RegWrite(ops[0].reg.value, F("(uint32_t)sse_cvt(%s)", s >= 0 ? F("ctx.xmm[%d].f[0]", s).c_str() : "X86_MEMF32(ea)")));
+            emit(RegWrite(ops[0].reg.value, F("(uint32_t)sse_cvt(%s)", srcf0().c_str())));
             return true;
         case ZYDIS_MNEMONIC_CVTTSS2SI:
-            emit(RegWrite(ops[0].reg.value, F("(uint32_t)sse_cvtt(%s)", s >= 0 ? F("ctx.xmm[%d].f[0]", s).c_str() : "X86_MEMF32(ea)")));
+            emit(RegWrite(ops[0].reg.value, F("(uint32_t)sse_cvtt(%s)", srcf0().c_str())));
             return true;
         case ZYDIS_MNEMONIC_CVTPI2PS: {
             std::string src = MmIndex(ops[1]) >= 0 ? F("ctx.mm[%d]", MmIndex(ops[1])) : "X86_MEM64(ea)";
-            emit(F("uint64_t v = %s; ctx.xmm[%d].f[0] = (float)(int32_t)(uint32_t)v; ctx.xmm[%d].f[1] = (float)(int32_t)(uint32_t)(v >> 32);",
-                   src.c_str(), d, d));
+            emit(F("uint64_t v = %s; %s[0] = x86_u((float)(int32_t)(uint32_t)v); %s[1] = x86_u((float)(int32_t)(uint32_t)(v >> 32));",
+                   src.c_str(), D.c_str(), D.c_str()));
             return true;
         }
         case ZYDIS_MNEMONIC_CVTPS2PI:
         case ZYDIS_MNEMONIC_CVTTPS2PI: {
             const char* fn = m == ZYDIS_MNEMONIC_CVTPS2PI ? "sse_cvt" : "sse_cvtt";
-            std::string src = s >= 0 ? F("ctx.xmm[%d]", s) : "*X86_PTR(X86Xmm, ea)";
-            emit(F("X86Xmm v = %s; ctx.mm[%d] = (uint64_t)(uint32_t)%s(v.f[0]) | ((uint64_t)(uint32_t)%s(v.f[1]) << 32);",
-                   src.c_str(), MmIndex(ops[0]), fn, fn));
+            emit(F("x86_v4u v = %s; ctx.mm[%d] = (uint64_t)(uint32_t)%s(x86_f(v[0])) | ((uint64_t)(uint32_t)%s(x86_f(v[1])) << 32);",
+                   src128().c_str(), MmIndex(ops[0]), fn, fn));
             return true;
         }
         case ZYDIS_MNEMONIC_SHUFPS: {
             int imm = int(ops[2].imm.value.u);
-            emit(F("X86Xmm a = ctx.xmm[%d], b = %s; ctx.xmm[%d].u[0] = a.u[%d]; ctx.xmm[%d].u[1] = a.u[%d]; ctx.xmm[%d].u[2] = b.u[%d]; ctx.xmm[%d].u[3] = b.u[%d];",
-                   d, src128().c_str(), d, imm & 3, d, (imm >> 2) & 3, d, (imm >> 4) & 3, d, (imm >> 6) & 3));
+            emit(F("x86_v4u v = %s; %s = __builtin_shufflevector(%s, v, %d, %d, %d, %d);", src128().c_str(), D.c_str(), D.c_str(), imm & 3,
+                   (imm >> 2) & 3, 4 + ((imm >> 4) & 3), 4 + ((imm >> 6) & 3)));
             return true;
         }
         case ZYDIS_MNEMONIC_UNPCKLPS:
-            emit(F("X86Xmm a = ctx.xmm[%d], b = %s; ctx.xmm[%d].u[0] = a.u[0]; ctx.xmm[%d].u[1] = b.u[0]; ctx.xmm[%d].u[2] = a.u[1]; ctx.xmm[%d].u[3] = b.u[1];",
-                   d, src128().c_str(), d, d, d, d));
+            emit(F("x86_v4u v = %s; %s = __builtin_shufflevector(%s, v, 0, 4, 1, 5);", src128().c_str(), D.c_str(), D.c_str()));
             return true;
         case ZYDIS_MNEMONIC_UNPCKHPS:
-            emit(F("X86Xmm a = ctx.xmm[%d], b = %s; ctx.xmm[%d].u[0] = a.u[2]; ctx.xmm[%d].u[1] = b.u[2]; ctx.xmm[%d].u[2] = a.u[3]; ctx.xmm[%d].u[3] = b.u[3];",
-                   d, src128().c_str(), d, d, d, d));
+            emit(F("x86_v4u v = %s; %s = __builtin_shufflevector(%s, v, 2, 6, 3, 7);", src128().c_str(), D.c_str(), D.c_str()));
             return true;
-        case ZYDIS_MNEMONIC_MOVMSKPS:
-            emit(RegWrite(ops[0].reg.value, F("(ctx.xmm[%d].u[0] >> 31) | (ctx.xmm[%d].u[1] >> 31) << 1 | (ctx.xmm[%d].u[2] >> 31) << 2 | (ctx.xmm[%d].u[3] >> 31) << 3", s, s, s, s)));
+        case ZYDIS_MNEMONIC_MOVMSKPS: {
+            std::string S = X(s);
+            emit(RegWrite(ops[0].reg.value, F("(%s[0] >> 31) | (%s[1] >> 31) << 1 | (%s[2] >> 31) << 2 | (%s[3] >> 31) << 3", S.c_str(),
+                                              S.c_str(), S.c_str(), S.c_str())));
             return true;
-        case ZYDIS_MNEMONIC_LDMXCSR: emit("ctx.mxcsr = X86_MEM32(ea);"); return true;
+        }
+        case ZYDIS_MNEMONIC_LDMXCSR: emit("ctx.mxcsr = X86_MEM32(ea); X86_FZ_RELOAD;"); return true;
         case ZYDIS_MNEMONIC_STMXCSR: emit("X86_MEM32(ea) = ctx.mxcsr;"); return true;
         default:
             return false;

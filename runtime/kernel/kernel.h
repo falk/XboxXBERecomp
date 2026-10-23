@@ -102,16 +102,29 @@ inline uint32_t CallGuest(X86Context& ctx, uint32_t fn, std::initializer_list<ui
 // objects
 enum class ObjType : uint8_t { Event, Semaphore, Mutant, Timer, Thread, File, SymLink, Device, Queue, Other };
 
+struct Waiter;
 struct Object {
     ObjType type;
     uint32_t guest = 0;  // body in guest memory, dispatcher header first for waitables
-    // dispatcher state, protected by the dispatcher lock
-    int32_t signal = 0;
+    uint32_t slot = 0;   // index in the dispatcher table, kept in the header's WaitListHead.Flink once bound
+    bool shadow = false;  // built from a header the guest initialised, rebuilt in place when the guest reinitialises it
+    // SignalState: the dispatcher header's (guest + 4) once bound, `local` before and for objects without a header.
+    // The header is the one waits and signals use, as on the Xbox, so the title's own stores there take effect (an
+    // event cleared inline, `SignalState = 0` before a wait, is reset). The host changes it only through atomics: a
+    // release (set, release) publishes the signaller's writes to the thread whose acquire (a satisfied wait) consumes
+    // it.
+    alignas(4) mutable int32_t local = 0;
+    std::atomic_ref<int32_t> state() const {
+        return std::atomic_ref<int32_t>(guest ? *reinterpret_cast<int32_t*>(g_base + guest + 4) : local);
+    }
     int32_t limit = 0;
-    bool notification = false;  // manual reset event or notification timer
-    uint32_t owner = 0;         // mutant owner thread
-    uint32_t recursion = 0;
+    bool notification = false;           // manual reset event or notification timer
+    std::atomic<uint32_t> owner{0};      // mutant owner thread
+    uint32_t recursion = 0;              // changed by the owner only
+    std::atomic<int32_t> waiters{0};     // blocked waiters; a signaller with none skips the dispatcher lock
+    std::vector<Waiter*> wait_list;      // blocked waiters in arrival order, under the dispatcher lock
     std::string name;
+    int32_t Signal() const { return state().load(std::memory_order_acquire); }
     explicit Object(ObjType t) : type(t) {}
     virtual ~Object() = default;
 };
@@ -122,15 +135,19 @@ ObjectRef FromHandle(uint32_t handle);
 bool CloseHandle(uint32_t handle);
 uint32_t DuplicateHandle(uint32_t handle);
 ObjectRef FromPointer(uint32_t guest);  // dispatcher object in guest memory, created on first use
+// FromPointer without the reference count: objects bound to guest memory live as long as the process
+Object* Dispatcher(uint32_t guest);
 void Bind(ObjectRef obj, uint32_t guest);
 ObjectRef FindNamed(const std::string& name);
 void AddNamed(const std::string& name, ObjectRef obj);
 
 // dispatcher
+// Objects change state without a lock; the dispatcher lock guards the wait lists and the waits that block.
 std::mutex& DispatchLock();
-void SignalChanged();  // wakes every waiter, caller holds the lock
-void SetSignal(Object& o, int32_t v);
+void SetSignal(Object& o, int32_t v);  // stores the state and satisfies the waiters it can
 uint32_t Wait(const std::vector<ObjectRef>& objs, bool wait_all, int64_t timeout_100ns, bool alertable);
+uint32_t Wait(Object* const* objs, size_t count, bool wait_all, int64_t timeout_100ns, bool alertable);
+void WakeAlertable(Waiter& w);  // an APC was queued for the thread blocked in w; caller holds the dispatcher lock
 int32_t SetEvent(Object& o);
 int32_t ResetEvent(Object& o);
 int32_t PulseEvent(Object& o);
@@ -151,10 +168,14 @@ struct Thread : Object {
     uint32_t kpcr = 0, ethread = 0, stack_top = 0, stack_size = 0, tls = 0;
     uint32_t exit_code = 0;
     int priority = 0;
+    int xbox_priority = 8;  // the scheduling priority (0-31) the base priority and its increments give
     std::atomic<int> suspend{0};
     std::mutex apc_lock;
     std::deque<std::array<uint32_t, 4>> apcs;  // routine, arg1, arg2, arg3
     std::condition_variable resume_cv;
+    Waiter* alertable_wait = nullptr;  // the alertable wait the thread is blocked in, under the dispatcher lock
+    uint32_t host_thread = 0;          // Horizon thread handle, for core placement
+    uintptr_t host_pthread = 0;        // POSIX: the pthread, for XBE_SCHED
     X86Context* ctx = nullptr;
     Thread() : Object(ObjType::Thread) {}
 };
@@ -177,6 +198,12 @@ void SuspendPoint();           // blocks the current thread while it is suspende
 bool RunApcs(Thread& t);
 void QueueApc(Thread& t, uint32_t routine, uint32_t a1, uint32_t a2, uint32_t a3);
 std::vector<ThreadRef> Threads();
+// the priority of StartHostThread's threads: above the 31 thread priorities, as interrupts and DPCs
+constexpr int kInterruptPriority = 32;
+// runs t at t.xbox_priority where the host schedules by priority (XBE_SCHED on Linux)
+void ApplyPriority(Thread& t);
+// Horizon: places a runtime thread that runs no guest code (timers, clock) off the guest core
+void PlaceHostThread(const char* name);
 
 // files
 void MountDefaults(const std::string& game_dir, const std::string& data_dir);
@@ -198,6 +225,9 @@ extern std::string g_launch_file;
 void SavePersistedDisplay(uint32_t common, uint32_t format, uint32_t size, const void* pixels, uint32_t bytes);
 uint32_t SavedDataAddress();
 void SetSavedDataAddress(uint32_t surface);
+// guest critical sections the calling thread holds; fn runs on a thread as it releases the last one it held
+int CriticalSectionsHeld();
+void OnCriticalSectionsReleased(void (*fn)());
 // one bit of note carried with the kept display to the next instance
 void MarkPersistedDisplay();
 bool KeptDisplayMarked();
@@ -220,5 +250,11 @@ const char* OrdinalName(uint32_t ordinal);  // public name, "?" past the table
 // guest kernel variables updated by the host
 extern uint32_t g_tick_count_va;
 extern uint32_t g_launch_data_page_va;
+
+// called with the Xbox path of every file opened on a host file (NtCreateFile), when set; unattended runs use it to
+// time their input
+extern void (*g_on_open)(const char* name);
+// when set, the Xbox path of a file to open instead, or null for the file itself (a title setting that swaps a film)
+extern const char* (*g_redirect_file)(const char* name);
 
 }  // namespace kernel

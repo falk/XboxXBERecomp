@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <fstream>
 #include <sstream>
+#include <cstring>
 
 #include "codegen.h"
 
@@ -28,6 +29,155 @@ static void WriteIfChanged(const fs::path& p, const std::string& text) {
     }
     std::ofstream out(p, std::ios::binary);
     out << text;
+}
+
+
+// Guest registers live in locals of the function: the eight integer registers (x86_eax ...), the SSE registers
+// (x86_xmmN, named so by the SSE emitter) and the MMX registers. The compiler keeps them in host registers instead of
+// reloading and storing ctx fields, also across the compiler barrier of a backward jump (which only has to make guest
+// memory reread). The locals go back to ctx before anything that may read the context (a call, an indirect or kernel
+// call, a hook, a trap, cpuid, a string helper, a return) and are reloaded after it.
+static bool IdentChar(char c) { return std::isalnum((unsigned char)c) || c == '_'; }
+
+// end of the statement starting at p (the index after its ';'), skipping parentheses and string literals
+static size_t StatementEnd(const std::string& s, size_t p) {
+    int depth = 0;
+    for (size_t i = p; i < s.size(); i++) {
+        char c = s[i];
+        if (c == '"') {
+            for (i++; i < s.size() && s[i] != '"'; i++)
+                if (s[i] == '\\') i++;
+            continue;
+        }
+        if (c == '(') depth++;
+        else if (c == ')') depth--;
+        else if (c == ';' && depth == 0) return i + 1;
+    }
+    return std::string::npos;
+}
+
+static const char* const kGprs[8] = {"eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi"};
+
+static std::string PromoteRegs(const std::string& body, const std::set<std::string>& hooks, std::string& prologue) {
+    bool xmm[8] = {}, mm[8] = {}, gpr[8] = {};
+    bool any = false;
+    for (size_t p = body.find("x86_xmm"); p != std::string::npos; p = body.find("x86_xmm", p + 1))
+        if (std::isdigit((unsigned char)body[p + 7])) xmm[body[p + 7] - '0'] = any = true;
+    for (size_t p = body.find("ctx.mm["); p != std::string::npos; p = body.find("ctx.mm[", p + 1))
+        if (std::isdigit((unsigned char)body[p + 7])) mm[body[p + 7] - '0'] = any = true;
+    for (int r = 0; r < 8; r++)
+        for (size_t p = body.find(std::string("ctx.") + kGprs[r]); p != std::string::npos && !gpr[r];
+             p = body.find(std::string("ctx.") + kGprs[r], p + 1))
+            if (!IdentChar(body[p + 7])) gpr[r] = any = true;
+    if (body.find("X86_PUSH32(") != std::string::npos) gpr[4] = any = true;  // the push macro moves esp
+    // the MXCSR.FZ mask of SSE arithmetic: read at entry, after anything that may run ldmxcsr, and at ldmxcsr itself
+    bool fz = body.find("x86_fz)") != std::string::npos;
+    std::string body_fz = body;
+    for (size_t p = body_fz.find("X86_FZ_RELOAD;"); p != std::string::npos; p = body_fz.find("X86_FZ_RELOAD;", p))
+        body_fz.replace(p, 14, fz ? "x86_fz = x86_fzmask(ctx.mxcsr);" : "");
+    if (!any) return body_fz;
+    std::string save, load;
+    if (fz) {
+        prologue += "\tuint32_t x86_fz = x86_fzmask(ctx.mxcsr);\n";
+        load += "x86_fz = x86_fzmask(ctx.mxcsr); ";
+    }
+    for (int r = 0; r < 8; r++)
+        if (gpr[r]) {
+            prologue += F("\tuint32_t x86_%s = ctx.%s;\n", kGprs[r], kGprs[r]);
+            save += F("ctx.%s = x86_%s; ", kGprs[r], kGprs[r]);
+            load += F("x86_%s = ctx.%s; ", kGprs[r], kGprs[r]);
+        }
+    for (int i = 0; i < 8; i++) {
+        if (xmm[i]) {
+            prologue += F("\tx86_v4u x86_xmm%d = x86_vu(ctx.xmm[%d]);\n", i, i);
+            save += F("ctx.xmm[%d] = x86_xm(x86_xmm%d); ", i, i);
+            load += F("x86_xmm%d = x86_vu(ctx.xmm[%d]); ", i, i);
+        }
+        if (mm[i]) {
+            prologue += F("\tuint64_t x86_mm%d = ctx.mm[%d];\n", i, i);
+            save += F("ctx.mm[%d] = x86_mm%d; ", i, i);
+            load += F("x86_mm%d = ctx.mm[%d]; ", i, i);
+        }
+    }
+    // registers to locals
+    std::string s;
+    s.reserve(body_fz.size() + body_fz.size() / 4);
+    for (size_t i = 0; i < body_fz.size();) {
+        if (body_fz.compare(i, 7, "ctx.mm[") == 0 && i + 8 < body_fz.size() && body_fz[i + 8] == ']') {
+            s += "x86_mm";
+            s += body_fz[i + 7];
+            i += 9;
+            continue;
+        }
+        if (body_fz.compare(i, 4, "ctx.") == 0 && (i == 0 || !IdentChar(body_fz[i - 1]))) {
+            bool done = false;
+            for (int r = 0; r < 8 && !done; r++)
+                if (body_fz.compare(i + 4, 3, kGprs[r]) == 0 && i + 7 < body_fz.size() && !IdentChar(body_fz[i + 7])) {
+                    s += "x86_";
+                    s += kGprs[r];
+                    i += 7;
+                    done = true;
+                }
+            if (done) continue;
+        }
+        if (body_fz.compare(i, 11, "X86_PUSH32(") == 0 && (i == 0 || !IdentChar(body_fz[i - 1]))) {
+            s += "X86_PUSHL(";
+            i += 11;
+            continue;
+        }
+        s += body_fz[i++];
+    }
+    // synchronise around every statement that hands ctx to other code
+    auto starts_call = [&](size_t i, bool& is_hook) -> bool {
+        is_hook = false;
+        if (i > 0 && IdentChar(s[i - 1])) return false;
+        static const char* names[] = {"x86_icall(ctx, base", "x86_icall_fast(ctx, base", "x86_kernel(ctx, base", "x86_trap(ctx,",
+                                      "x86_priv(ctx,", "x86_cpuid(ctx)", "x86_rep_movs(ctx,", "x86_rep_stos(ctx,"};
+        for (const char* n : names)
+            if (s.compare(i, std::strlen(n), n) == 0) return true;
+        if (s.compare(i, 4, "sub_") == 0 && i + 12 < s.size() && s.compare(i + 12, 11, "(ctx, base)") == 0) return true;
+        for (const std::string& h : hooks)
+            if (s.compare(i, h.size(), h) == 0 && s.compare(i + h.size(), 11, "(ctx, base)") == 0) {
+                is_hook = true;
+                return true;
+            }
+        return false;
+    };
+    std::string o;
+    o.reserve(s.size() + s.size() / 2);
+    for (size_t i = 0; i < s.size();) {
+        bool is_hook = false;
+        // a return: the esp adjustment first, then the registers go back
+        for (const char* esp : {"x86_esp += ", "ctx.esp += "}) {
+            if (s.compare(i, 11, esp) != 0 || (i > 0 && IdentChar(s[i - 1]))) continue;
+            size_t e = StatementEnd(s, i);
+            if (e != std::string::npos && s.compare(e, 8, " return;") == 0) {
+                o += "{ " + s.substr(i, e - i) + " " + save + "return; }";
+                i = e + 8;
+                is_hook = true;  // consumed
+                break;
+            }
+        }
+        if (is_hook) continue;
+        if (starts_call(i, is_hook)) {
+            size_t e = StatementEnd(s, i);
+            if (e != std::string::npos) {
+                if (is_hook) {
+                    // "bool hook = name(ctx, base);" keeps its scope: no braces, the save goes before the declaration
+                    size_t decl = o.rfind("bool hook = ");
+                    if (decl != std::string::npos && decl + 12 == o.size()) o.insert(decl, save);
+                    else o += save;
+                    o += s.substr(i, e - i) + " " + load;
+                } else {
+                    o += "{ " + save + s.substr(i, e - i) + " " + load + "}";
+                }
+                i = e;
+                continue;
+            }
+        }
+        o += s[i++];
+    }
+    return o;
 }
 
 std::string CodeGen::EmitFunction(uint32_t entry) {
@@ -62,6 +212,17 @@ std::string CodeGen::EmitFunction(uint32_t entry) {
                 for (auto* x : {&it->second.on_true, &it->second.on_false})
                     if (x->set && !x->ret) targets.insert(x->to);
     }
+    x87_static_ = false;
+    if (an_.cfg.x87_static_stack) {
+        std::string why;
+        x87_static_ = X87Plan(body, why);
+        if (x87_static_ || !why.empty()) x87_funcs_++;
+        if (x87_static_) x87_static_funcs_++;
+        else if (!why.empty()) {
+            x87_fallback_[why]++;
+            if (why != "few x87 instructions per call") x87_fallback_funcs_.push_back(entry);  // the ones it could not do
+        }
+    }
     body_.clear();
     if (body.empty()) Line(F("\tx86_trap(ctx, 0x%X, \"function was not decoded\");", entry));
     for (size_t i = 0; i < body.size(); i++) {
@@ -75,22 +236,34 @@ std::string CodeGen::EmitFunction(uint32_t entry) {
         ZydisDecodedInstruction in;
         ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
         if (!info || info->flow == Flow::Invalid || !an_.Decode(va, in, ops)) {
-            Line(F("\tx86_trap(ctx, 0x%X, \"undecodable instruction\");", va));
+            if (x87_static_) {
+                x87_depth_ = x87_.at(va).in;
+                x87_dirty_ = x87_.at(va).dirty_in;
+            }
+            Line(F("\t%sx86_trap(ctx, 0x%X, \"undecodable instruction\");", X87Out().c_str(), va));
             pending_.valid = false;
             continue;
         }
         Line("\t// " + F("%08X ", va) + Text(va, in, ops));
         uint32_t next_body = i + 1 < body.size() ? body[i + 1] : 0;
+        if (x87_static_) {
+            x87_depth_ = x87_.at(va).in;
+            x87_dirty_ = x87_.at(va).dirty_in;
+        }
         EmitInsn(va, in, ops, next_body);
         if (!an_.cfg.hooks.empty()) EmitHooks(va, true);
         bool falls = info->flow == Flow::Normal || info->flow == Flow::Call || info->flow == Flow::CallIndirect ||
                      info->flow == Flow::Jcc;
         uint32_t next = va + info->len;
         if (falls && next_body != next) {
+            if (x87_static_) {
+                x87_depth_ = x87_.at(va).out;
+                x87_dirty_ = x87_.at(va).dirty_out;
+            }
             if (an_.InsnAt(next) || an_.functions.count(next))
                 Line("\t" + Target(next));
             else
-                Line(F("\tx86_trap(ctx, 0x%X, \"fell off decoded code\");", next));
+                Line(F("\t%sx86_trap(ctx, 0x%X, \"fell off decoded code\");", X87Out().c_str(), next));
         }
     }
     // a function that registers an SEH frame (mov fs:[0], ...) may be where a C++ catch resumes: the CRT's jump to
@@ -104,10 +277,18 @@ std::string CodeGen::EmitFunction(uint32_t entry) {
             ops[0].mem.index == ZYDIS_REGISTER_NONE && ops[0].mem.disp.value == 0)
             seh = true;
     }
+    bool uses_fcmp = body_.find(" fa = a; fb = b;") != std::string::npos;
     std::string out;
     out += F("X86_FUNC(__imp__%s) {\n", FuncName(entry).c_str());
     if (seh) out += "\tconst uint32_t x86_frame = ctx.esp;\n\ttry {\n";
     out += "\tX86_LOAD_FLAGS();\n\tuint32_t ca = 0, cb = 0;\n\t(void)ca; (void)cb;\n";
+    if (uses_fcmp) out += "\tfloat fa = 0, fb = 0;\n\t(void)fa; (void)fb;\n";
+    std::set<std::string> hook_names;
+    for (auto& [hva, h] : an_.cfg.hooks) hook_names.insert(h.call);
+    std::string prologue;
+    body_ = PromoteRegs(body_, hook_names, prologue);
+    out += prologue;
+    if (x87_static_) out += X87Prologue();
     // code below the entry (a shared tail reached by a jump) is emitted first, so enter by label
     bool entry_first = !body.empty() && body.front() == entry;
     if (!entry_first) out += F("\tgoto loc_%08X;\n", entry);
@@ -118,7 +299,7 @@ std::string CodeGen::EmitFunction(uint32_t entry) {
     if (an_.cfg.trace.count(entry))
         out += F("X86_TRACED_FUNC(%s, __imp__%s, 0x%XU)\n\n", FuncName(entry).c_str(), FuncName(entry).c_str(), entry);
     else  // weak, so a host function of the same name replaces it
-        out += F("X86_WEAK_FUNC(%s, __imp__%s)\n\n", FuncName(entry).c_str(), FuncName(entry).c_str());
+        out += F("X86_WEAK_ALIAS(%s, __imp__%s)\n\n", FuncName(entry).c_str(), FuncName(entry).c_str());
     return out;
 }
 
@@ -288,28 +469,36 @@ bool CodeGen::Run() {
     map += "\t0,\n};\n";
     for (uint32_t f : absent) {
         map += F("\nX86_FUNC(__imp__%s) { x86_trap(ctx, 0x%Xu, \"not in this image\"); }\n", FuncName(f).c_str(), f);
-        map += F("X86_WEAK_FUNC(%s, __imp__%s)\n", FuncName(f).c_str(), FuncName(f).c_str());
+        map += F("X86_WEAK_ALIAS(%s, __imp__%s)\n", FuncName(f).c_str(), FuncName(f).c_str());
     }
     WriteIfChanged(out_ / "x86_func_mapping.cpp", map);
 
     // the game code DLL exports its tables and each recompiled body (one name a function: PE allows 65535); the
-    // executable's import library also takes a function's own name, for the calls it makes where it has no override
-    std::string library = F("LIBRARY %s\nEXPORTS\n", an_.cfg.library.c_str());
-    std::string exports;
-    std::string aliases;
-    for (const char* table : {"X86FuncMappings", "X86Continuations", "X86CodeBase", "X86CodeEnd", "X86EntryPoint"})
-        exports += F("    %s DATA\n", table);
-    for (const std::vector<uint32_t>* list : {&funcs, &absent}) {
-        for (uint32_t f : *list) {
-            std::string name = FuncName(f);
-            exports += F("    __imp__%s\n", name.c_str());
-            aliases += F("    %s == __imp__%s\n", name.c_str(), name.c_str());
+    // executable's import library also takes a function's own name, for the calls it makes where it has no override.
+    // Without [xbe] library (ports that link the game code into the executable) there is no DLL and no .def
+    if (!an_.cfg.library.empty()) {
+        std::string library = F("LIBRARY %s\nEXPORTS\n", an_.cfg.library.c_str());
+        std::string exports;
+        std::string aliases;
+        for (const char* table : {"X86FuncMappings", "X86Continuations", "X86CodeBase", "X86CodeEnd", "X86EntryPoint"})
+            exports += F("    %s DATA\n", table);
+        for (const std::vector<uint32_t>* list : {&funcs, &absent}) {
+            for (uint32_t f : *list) {
+                std::string name = FuncName(f);
+                exports += F("    __imp__%s\n", name.c_str());
+                aliases += F("    %s == __imp__%s\n", name.c_str(), name.c_str());
+            }
         }
+        WriteIfChanged(out_ / "exports.def", library + exports);
+        WriteIfChanged(out_ / "imports.def", library + exports + aliases);
     }
-    WriteIfChanged(out_ / "exports.def", library + exports);
-    WriteIfChanged(out_ / "imports.def", library + exports + aliases);
 
     std::string stats = F("functions %zu\ninstructions %zu\n", funcs.size(), insn_count_);
+    if (an_.cfg.x87_static_stack) {
+        stats += F("x87 functions %zu, static stack %zu\n", x87_funcs_, x87_static_funcs_);
+        for (auto& [why, n] : x87_fallback_) stats += F("x87 dynamic (%s) %zu\n", why.c_str(), n);
+        for (uint32_t f : x87_fallback_funcs_) stats += F("x87 dynamic %s\n", FuncName(f).c_str());
+    }
     for (auto& [k, v] : unimpl_) stats += F("unimplemented %s %zu\n", k.c_str(), v);
     WriteIfChanged(out_ / "x86_recomp_stats.txt", stats);
     std::fprintf(stderr, "%s", stats.c_str());

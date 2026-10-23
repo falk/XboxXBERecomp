@@ -153,6 +153,13 @@ void Release(X86Context& ctx, uint32_t res) {
 
 void Walk(uint32_t end);
 
+// Vertices a title pushes between Begin and End by hand are drawn when the push buffer is read; read it before a
+// state change, so they draw with the state they were pushed under (Burnout 3's post process does this)
+void FlushImmediate() {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    Walk(Dev(kDevPush));
+}
+
 // Hardware commands a caller still pushes go to a scratch buffer, rewound at every request once Walk has read it
 uint32_t ScratchPush(uint32_t bytes = 0) {
     Walk(Dev(kDevPush));
@@ -534,6 +541,7 @@ void ApplyRenderTarget(X86Context& ctx, uint32_t rt, uint32_t zs) {
 }  // namespace
 
 HLE_STDCALL(D3DDevice_SetRenderTarget, 2) {
+    FlushImmediate();
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     uint32_t rt = a[0] ? a[0] : Dev(kDevRenderTarget);
     ApplyRenderTarget(ctx, rt, a[1]);
@@ -541,12 +549,16 @@ HLE_STDCALL(D3DDevice_SetRenderTarget, 2) {
     uint32_t w, h;
     gpu::SurfaceSize(g_state.rt, w, h);
     g_state.viewport = {0, 0, w, h, 0.0f, 1.0f};
+    g_state.scissor_count = 0;
     UpdateViewportConstants();
+    // the depth scale of the new depth buffer, as the library's SetRenderTarget stores it for inlined readers
+    std::memcpy(HostPtr(kDevice + kDevZScale), &g_state.zscale, 4);
     return 0;
 }
 
 // (rt, zs, flags): the surfaces alone, the viewport stays as it was
 HLE_STDCALL(D3DDevice_SetRenderTargetFast, 3) {
+    FlushImmediate();
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     ApplyRenderTarget(ctx, a[0], a[1]);
     return 0;
@@ -616,6 +628,7 @@ HLE_STDCALL(D3DDevice_Swap, 1) {
 }
 
 HLE_STDCALL(D3DDevice_Clear, 6) {
+    FlushImmediate();
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     const uint8_t* rects = a[0] && a[1] ? static_cast<const uint8_t*>(HostPtr(a[1])) : nullptr;
     if (g_backend) g_backend->Clear(g_state, a[0], rects, a[2], a[3], ArgF(a, 4), a[5]);
@@ -634,12 +647,14 @@ HLE_STDCALL(D3DDevice_Reset, 1) {
 }
 
 HLE_STDCALL(D3DDevice_CopyRects, 5) {
+    FlushImmediate();
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     if (g_backend) g_backend->Copy(SurfaceOf(a[0]), SurfaceOf(a[3]), a[2], a[1], a[4]);
     return 0;
 }
 
 HLE_STDCALL(D3DDevice_SetViewport, 1) {
+    FlushImmediate();
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     uint32_t v = a[0];
     g_state.viewport = {R32(v), R32(v + 4), R32(v + 8), R32(v + 12), GF(v + 16), GF(v + 20)};
@@ -649,6 +664,7 @@ HLE_STDCALL(D3DDevice_SetViewport, 1) {
 }
 
 HLE_STDCALL(D3DDevice_SetScissors, 3) {
+    FlushImmediate();
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     g_state.scissor_count = std::min<uint32_t>(a[0], 8);
     for (uint32_t i = 0; i < g_state.scissor_count * 4; i++) g_state.scissors[i] = R32(a[2] + i * 4);
@@ -656,6 +672,7 @@ HLE_STDCALL(D3DDevice_SetScissors, 3) {
 }
 
 HLE_STDCALL(D3DDevice_SetScreenSpaceOffset, 2) {
+    FlushImmediate();
     g_state.ss_offset_x = ArgF(a, 0);
     g_state.ss_offset_y = ArgF(a, 1);
     UpdateViewportConstants();
@@ -665,12 +682,14 @@ HLE_STDCALL(D3DDevice_SetScreenSpaceOffset, 2) {
 // render states
 
 HLE_FASTCALL(D3DDevice_SetRenderState_Simple, 0) {
+    FlushImmediate();
     uint32_t method = a[0] & 0x1FFC, value = a[1];
     g_state.simple[method >> 2] = value;
     return 0;
 }
 
 HLE_STDCALL(D3DDevice_SetRenderStateNotInline, 2) {
+    FlushImmediate();
     uint32_t rs = a[0], v = a[1];
     if (rs < gpu::kRsDeferredFirst) {
         uint32_t method = R32(kSimpleEncode + rs * 4) & 0x1FFC;
@@ -718,23 +737,28 @@ COMPLEX_STATE(RopZRead, gpu::kRsRopZRead)
 COMPLEX_STATE(DoNotCullUncompressed, gpu::kRsDoNotCullUncompressed)
 
 HLE_STDCALL(D3DDevice_SetTextureState_TexCoordIndex, 2) {
+    FlushImmediate();
     g_state.tss[a[0] & 3][gpu::kTssTexCoordIndex] = a[1];
     W32(kTextureState + ((a[0] & 3) * kStageStates + gpu::kTssTexCoordIndex) * 4, a[1]);
     return 0;
 }
 HLE_STDCALL(D3DDevice_SetTextureState_BumpEnv, 3) {
+    FlushImmediate();
     if (a[1] >= gpu::kTssBumpEnvMat00 && a[1] <= gpu::kTssBumpEnvLOffset) g_state.tss[a[0] & 3][a[1]] = a[2];
     return 0;
 }
 HLE_STDCALL(D3DDevice_SetTextureState_BorderColor, 2) {
+    FlushImmediate();
     g_state.tss[a[0] & 3][gpu::kTssBorderColor] = a[1];
     return 0;
 }
 HLE_STDCALL(D3DDevice_SetTextureState_ColorKeyColor, 2) {
+    FlushImmediate();
     g_state.tss[a[0] & 3][gpu::kTssColorKeyColor] = a[1];
     return 0;
 }
 HLE_STDCALL(D3DDevice_SetTextureStageStateNotInline, 3) {
+    FlushImmediate();
     uint32_t stage = a[0] & 3, type = a[1], v = a[2];
     if (type < gpu::kTssCount) {
         g_state.tss[stage][type] = v;
@@ -746,6 +770,7 @@ HLE_STDCALL(D3DDevice_SetTextureStageStateNotInline, 3) {
 // the XDK's transform types: view 0, projection 1, texture 2-5, world 6-9; the renderer keeps Direct3D 8's numbers
 // (view 2, projection 3, texture 16, world 256). The device copy is what GetTransform reads.
 HLE_STDCALL(D3DDevice_SetTransform, 2) {
+    FlushImmediate();
     uint32_t t = a[0];
     if (t >= 10) return 0;
     std::memcpy(HostPtr(kDevice + kDevTransforms + t * 64), HostPtr(a[1]), 64);
@@ -755,12 +780,14 @@ HLE_STDCALL(D3DDevice_SetTransform, 2) {
 }
 
 HLE_STDCALL(D3DDevice_SetMaterial, 1) {
+    FlushImmediate();
     std::memcpy(g_state.material.data(), HostPtr(a[0]), 17 * 4);
     return 0;
 }
 
 // the XDK keeps its own light lists, the renderer gets a copy
 HLE_WRAP(D3DDevice_SetLight, 2) {
+    FlushImmediate();
     uint32_t i = a[0], l = a[1];
     if (i < 8 && l) {
         std::lock_guard<std::recursive_mutex> lock(g_lock);
@@ -768,6 +795,7 @@ HLE_WRAP(D3DDevice_SetLight, 2) {
     }
 }
 HLE_WRAP(D3DDevice_LightEnable, 2) {
+    FlushImmediate();
     uint32_t i = a[0], on = a[1];
     if (i < 8) {
         std::lock_guard<std::recursive_mutex> lock(g_lock);
@@ -778,6 +806,7 @@ HLE_WRAP(D3DDevice_LightEnable, 2) {
 // resources in use
 
 HLE_STDCALL(D3DDevice_SetTexture, 2) {
+    FlushImmediate();
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     uint32_t stage = a[0] & 3, tex = a[1];
     uint32_t old = Dev(kDevTextures + stage * 4);
@@ -791,6 +820,7 @@ HLE_STDCALL(D3DDevice_SetTexture, 2) {
 
 // SetPalette(stage, palette): the colours a P8 texture of the stage looks up
 HLE_STDCALL(D3DDevice_SetPalette, 2) {
+    FlushImmediate();
     XDK_REQUIRE("d3d", XDK_KEY(CDevice_Palettes));
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     uint32_t stage = a[0] & 3, pal = a[1];
@@ -805,6 +835,7 @@ HLE_STDCALL(D3DDevice_SetPalette, 2) {
 // SwitchTexture(method, data, format), fastcall: a swizzled texture of the bound one's shape replaces it. It is
 // bound through a header of the stage's own holding the bound texture's fields with the new data and format.
 HLE_FASTCALL(D3DDevice_SwitchTexture, 1) {
+    FlushImmediate();
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     static uint32_t headers[4];
     // texture methods from 0x1B00, 0x40 per stage
@@ -819,6 +850,7 @@ HLE_FASTCALL(D3DDevice_SwitchTexture, 1) {
 }
 
 HLE_STDCALL(D3DDevice_SetStreamSource, 3) {
+    FlushImmediate();
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     uint32_t n = a[0] & 15, vb = a[1], stride = a[2];
     uint32_t old = R32(kStreams + n * kStreamSize + XDK_Stream_Buffer);
@@ -831,6 +863,7 @@ HLE_STDCALL(D3DDevice_SetStreamSource, 3) {
 }
 
 HLE_STDCALL(D3DDevice_SetIndices, 2) {
+    FlushImmediate();
     XDK_REQUIRE("d3d", XDK_DATA(D3D_IndexData));
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     uint32_t ib = a[0];
@@ -900,6 +933,7 @@ HLE_STDCALL(D3DDevice_GetVertexShaderFunction, 3) {
 }
 
 HLE_STDCALL(D3DDevice_SetVertexShader, 1) {
+    FlushImmediate();
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     uint32_t h = a[0];
     g_state.vs_handle = h;
@@ -919,24 +953,28 @@ HLE_STDCALL(D3DDevice_SetVertexShader, 1) {
 }
 
 HLE_FASTCALL(D3DDevice_SetVertexShaderConstant1Fast, 0) {
+    FlushImmediate();
     uint32_t reg = a[0];
     if (reg < 192) std::memcpy(g_state.vsc[reg].data(), HostPtr(a[1]), 16);
     return 0;
 }
 
 HLE_FASTCALL(D3DDevice_SetVertexShaderConstant1, 0) {
+    FlushImmediate();
     uint32_t reg = a[0];
     if (reg < 192) std::memcpy(g_state.vsc[reg].data(), HostPtr(a[1]), 16);
     return 0;
 }
 
 HLE_FASTCALL(D3DDevice_SetVertexShaderConstant4, 0) {
+    FlushImmediate();
     uint32_t reg = a[0], src = a[1];
     for (uint32_t i = 0; i < 4 && reg + i < 192; i++) std::memcpy(g_state.vsc[reg + i].data(), HostPtr(src + i * 16), 16);
     return 0;
 }
 
 HLE_FASTCALL(D3DDevice_SetVertexShaderConstantNotInlineFast, 1) {
+    FlushImmediate();
     uint32_t reg = a[0], src = a[1], dwords = a[2];
     for (uint32_t i = 0; i < dwords / 4 && reg + i < 192; i++) std::memcpy(g_state.vsc[reg + i].data(), HostPtr(src + i * 16), 16);
     return 0;
@@ -1041,6 +1079,7 @@ std::shared_ptr<gpu::VertexShader> SelectedShader(uint32_t handle, uint32_t slot
 
 // (handle, slot): the program a shader was made with, stored at the slot
 HLE_STDCALL(D3DDevice_LoadVertexShader, 2) {
+    FlushImmediate();
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     auto it = g_vs.find(a[0]);
     if (it == g_vs.end()) {
@@ -1060,6 +1099,7 @@ HLE_STDCALL(D3DDevice_LoadVertexShaderProgram, 2) {
 
 // (handle, slot): the program at the slot runs with the handle's inputs; handle 0 only moves the start
 HLE_STDCALL(D3DDevice_SelectVertexShader, 2) {
+    FlushImmediate();
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     uint32_t handle = a[0];
     bool program_bound = (g_state.vs_handle & 1) && g_state.vs;
@@ -1072,6 +1112,7 @@ HLE_STDCALL(D3DDevice_SelectVertexShader, 2) {
     return 0;
 }
 HLE_STDCALL(D3DDevice_SetShaderConstantMode, 1) {
+    FlushImmediate();
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     g_own_constants = a[0] & 0x10;  // D3DSCM_NORESERVEDCONSTANTS
     UpdateViewportConstants();
@@ -1096,6 +1137,7 @@ HLE_STDCALL(D3DDevice_DeletePixelShader, 1) {
 }
 
 HLE_STDCALL(D3DDevice_SetPixelShader, 1) {
+    FlushImmediate();
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     g_state.ps = nullptr;
     if (!a[0]) return 0;
@@ -1141,6 +1183,7 @@ HLE_STDCALL(D3DDevice_SetPixelShader, 1) {
 }
 
 HLE_STDCALL(D3DDevice_SetPixelShaderConstant, 3) {
+    FlushImmediate();
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     uint32_t reg = a[0], src = a[1], n = a[2];
     for (uint32_t i = 0; i < n && reg + i < 16; i++) std::memcpy(g_state.psc[reg + i].data(), HostPtr(src + i * 16), 16);
@@ -1243,7 +1286,8 @@ void EndPrimitive() {
     uint32_t prim = g_im_prim, count = uint32_t(g_im_vertices.size() / 64), handle = g_state.vs_handle;
     g_im_prim = 0;
     if (!prim || !count) return;
-    if (!(handle & 1) && (handle & 0xE) == 4) LOG_FIRST(1, "d3d: pretransformed immediate mode vertices are not supported");
+    // D3DFVF_XYZRHW: screen space vertices for the fixed pipeline, drawn with the FVF handle so they stay untransformed
+    const bool pretransformed = !(handle & 1) && (handle & 0xE) == 4;
     auto bound = g_state.vs, from = handle & 1 ? bound : nullptr;
     Made& m = made[{from.get(), g_im_mask}];
     if (!m.vs) {
@@ -1264,7 +1308,7 @@ void EndPrimitive() {
         for (uint32_t s = 0; s < 16; s++)
             if (g_im_mask >> s & 1) packed.insert(packed.end(), &g_im_vertices[v * 64 + s * 4], &g_im_vertices[v * 64 + s * 4] + 4);
     g_state.vs = m.vs;
-    g_state.vs_handle = handle | 1;
+    g_state.vs_handle = pretransformed ? handle : handle | 1;
     DrawUp(prim, count, packed.data(), m.vs->stream_stride[0]);
     g_state.vs = bound;
     g_state.vs_handle = handle;

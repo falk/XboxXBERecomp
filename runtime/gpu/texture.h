@@ -51,6 +51,10 @@ bool CopySurfaceMemory(const Surface& src, const Surface& dst, uint32_t count, u
 // the title locked a resource, the next bind re-uploads it
 void MarkDirty(uint32_t resource);
 uint64_t DirtyEpoch(uint32_t data_va);
+// the console's Morton order: the masks that spread x, y and z of a w x h x d picture over a texel index, and one
+// coordinate spread by its mask (index = MortonDeposit(x, mx) | MortonDeposit(y, my) | MortonDeposit(z, mz))
+void MortonMasks(uint32_t w, uint32_t h, uint32_t d, uint32_t& mx, uint32_t& my, uint32_t& mz);
+uint32_t MortonDeposit(uint32_t v, uint32_t mask);
 
 // vertex declarations and pixel shader constant routing, both follow the XDK's definitions
 void ParseDeclaration(VertexShader& vs);

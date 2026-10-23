@@ -1,3 +1,6 @@
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 #include "gpu/vertex.h"
 
 #include <algorithm>
@@ -229,7 +232,21 @@ bool Pretransformed(const State& s) {
 IndexBounds IndexRange(const uint8_t* ip, uint32_t count) {
     uint16_t lo16 = 0xFFFF;
     uint16_t hi16 = 0;
-    for (uint32_t i = 0; i < count; i++) {
+    uint32_t i = 0;
+#if defined(__aarch64__)
+    // eight indices a step: every indexed draw scans its indices for the vertex range
+    if (count >= 8) {
+        uint16x8_t lo = vdupq_n_u16(0xFFFF), hi = vdupq_n_u16(0);
+        for (; i + 8 <= count; i += 8) {
+            uint16x8_t v = vld1q_u16(reinterpret_cast<const uint16_t*>(ip + i * 2));
+            lo = vminq_u16(lo, v);
+            hi = vmaxq_u16(hi, v);
+        }
+        lo16 = vminvq_u16(lo);
+        hi16 = vmaxvq_u16(hi);
+    }
+#endif
+    for (; i < count; i++) {
         uint16_t v;
         std::memcpy(&v, ip + i * 2, 2);
         lo16 = std::min(lo16, v);
@@ -299,10 +316,11 @@ int AddRawBuffer(const State& s, const VertexShader& layout, const VertexShader:
     using namespace kernel;
     const auto& st = s.streams[size_t(in.stream)];
     uint32_t stride = StrideOf(s, layout, in);
-    const uint8_t* data = static_cast<const uint8_t*>(HostPtr(mem::VirtualFromPhysical(R32(st.vb + kResData))));
+    uint32_t va = mem::VirtualFromPhysical(R32(st.vb + kResData));
+    const uint8_t* data = static_cast<const uint8_t*>(HostPtr(va));
     int slot = int(out.buffer_count);
     if (dense) {
-        out.buffers[out.buffer_count++] = {data + size_t(d.first_vertex) * stride, d.span * stride, stride};
+        out.buffers[out.buffer_count++] = {data + size_t(d.first_vertex) * stride, d.span * stride, stride, va};
     } else {
         auto& g = out.gathered[out.buffer_count];
         GatherVertices(s, d, data, stride, g);

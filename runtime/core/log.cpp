@@ -68,7 +68,13 @@ void Write(Level lv, const char* fmt, ...) {
     n = std::min(n, int(sizeof(line)) - 1);
     if (g_file) {
         std::fwrite(line, 1, size_t(n), g_file);
-        if (lv >= Level::Warn) std::fflush(g_file);
+        // an error at once; warnings at most every quarter second (a mission load warns thousands of times, and on
+        // the Switch each flush is a write to the SD card)
+        static double flushed = 0;
+        if (lv >= Level::Error || (lv >= Level::Warn && t - flushed >= 0.25)) {
+            std::fflush(g_file);
+            flushed = t;
+        }
     }
     std::fwrite(line, 1, size_t(n), stderr);
 }

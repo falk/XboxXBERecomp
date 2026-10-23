@@ -47,6 +47,17 @@ std::recursive_mutex& UiLock() {
     return m;
 }
 
-void Pace() {}
+// XBE_PACE=1: presents at 60 Hz, for menus whose idle timers count frames; else as fast as the game runs
+void Pace() {
+    static const bool pace = [] {
+        const char* e = std::getenv("XBE_PACE");
+        return e && *e == '1';
+    }();
+    if (!pace) return;
+    using clock = std::chrono::steady_clock;
+    static clock::time_point next = clock::now();
+    next = std::max(next + std::chrono::microseconds(16667), clock::now() - std::chrono::milliseconds(50));
+    std::this_thread::sleep_until(next);
+}
 
 }  // namespace app

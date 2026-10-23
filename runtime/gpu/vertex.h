@@ -23,6 +23,7 @@ enum VertexDecode : uint8_t {
 struct VertexBuffer {
     const uint8_t* src = nullptr;
     uint32_t bytes = 0, stride = 0;
+    uint32_t va = 0;  // src is the guest's own vertex buffer: its data address (the lock key), else 0 (a copy)
 };
 
 // where input register r comes from: host vertex format (a DXGI_FORMAT), buffer, byte offset in the vertex

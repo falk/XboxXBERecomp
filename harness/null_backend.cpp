@@ -5,11 +5,13 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <set>
 #include <string>
 
 #include "app/app.h"
 #include "core/log.h"
 #include "gpu/backend.h"
+#include "gpu/shaders.h"
 #include "gpu/texture.h"
 #include "harness.h"
 #include "kernel/kernel.h"
@@ -86,6 +88,18 @@ private:
                      s.vs_handle, s.ps ? s.ps->handle : 0, s.rt.data, s.textures[0], s.rs[kRsLighting], s.simple[kMBlendEnable >> 2],
                      s.simple[kMSrcBlend >> 2], s.simple[kMDestBlend >> 2], s.simple[kMColorWriteEnable >> 2],
                      s.simple[kMAlphaTestEnable >> 2], s.rs[kRsZEnable]);
+        std::fprintf(f, "  viewport %u %u %u %u %g %g c-38 %g %g %g %g c-37 %g %g %g %g\n", s.viewport.x, s.viewport.y, s.viewport.w,
+                     s.viewport.h, s.viewport.min_z, s.viewport.max_z, s.vsc[58][0], s.vsc[58][1], s.vsc[58][2], s.vsc[58][3],
+                     s.vsc[59][0], s.vsc[59][1], s.vsc[59][2], s.vsc[59][3]);
+        // a short draw's vertex program, translated: which constants it reads
+        if (count <= 4 && (s.vs_handle & 1) && s.vs && !s.vs->program.empty()) {
+            static std::set<const void*> shown;
+            if (shown.insert(s.vs.get()).second) {
+                std::string body = VertexProgramHlsl(s.vs->program, 0xFFFF);
+                size_t at = body.find("main");
+                std::fprintf(f, "  program %08X:\n%s\n", s.vs_handle, body.substr(at == std::string::npos ? 0 : at).c_str());
+            }
+        }
         const auto& t0 = s.tss[0];
         TextureDesc d;
         if (s.textures[0] && Describe(s.textures[0], d))
@@ -114,7 +128,7 @@ private:
             // the vertex buffer's Data at +4 is a physical address
             uint32_t data = mem::VirtualFromPhysical(kernel::R32(s.streams[0].vb + 4)) + start * s.streams[0].stride;
             std::fprintf(f, "  v0 stride %u:", s.streams[0].stride);
-            for (uint32_t i = 0; i < s.streams[0].stride / 4 && i < 10; i++) {
+            for (uint32_t i = 0; i < s.streams[0].stride / 4 * (count <= 4 ? count : 1) && i < 48; i++) {
                 uint32_t v = kernel::R32(data + i * 4);
                 float x;
                 std::memcpy(&x, &v, 4);

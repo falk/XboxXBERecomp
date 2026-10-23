@@ -23,7 +23,7 @@
 
 #ifdef _WIN32
 #include <intrin.h>
-#else
+#elif defined(__x86_64__) || defined(__i386__)
 #include <x86intrin.h>
 #endif
 
@@ -49,7 +49,7 @@
 
 namespace {
 
-std::vector<X86Func*> g_table;  // one slot per code byte
+std::vector<X86Func*> g_table;  // one slot per code byte, the low bit set on continuations (x86_icall_fast)
 std::vector<bool> g_continuation;
 uint32_t g_lo = 0, g_hi = 0;
 #ifdef _WIN32
@@ -72,6 +72,9 @@ struct Export {
 Export g_exports[400];
 
 }  // namespace
+
+X86Func* const* x86_icall_table = nullptr;
+uint32_t x86_icall_lo = 0, x86_icall_count = 0;
 
 // synthetic guest addresses for kernel functions reached through a pointer
 constexpr uint32_t kKernelThunkBase = 0xFE000000;
@@ -111,11 +114,21 @@ void Init() {
     g_continuation.assign(g_hi - g_lo, false);
     for (const uint32_t* c = g_continuations; *c; c++)
         if (*c >= g_lo && *c < g_hi) g_continuation[*c - g_lo] = true;
-    LOGI("dispatch: %zu functions over %08X..%08X", n, g_lo, g_hi);
+    // the inline fast path needs the low bit of every host function free to mark the continuations
+    bool aligned = true;
+    for (X86Func* f : g_table) aligned &= !(reinterpret_cast<uintptr_t>(f) & 1);
+    if (aligned) {
+        for (size_t i = 0; i < g_continuation.size(); i++)
+            if (g_continuation[i]) g_table[i] = reinterpret_cast<X86Func*>(reinterpret_cast<uintptr_t>(g_table[i]) | 1);
+        x86_icall_table = g_table.data();
+        x86_icall_lo = g_lo;
+        x86_icall_count = g_hi - g_lo;
+    }
+    LOGI("dispatch: %zu functions over %08X..%08X%s", n, g_lo, g_hi, aligned ? "" : ", indirect calls without the fast path");
 }
 
 X86Func* Find(uint32_t guest) {
-    if (guest >= g_lo && guest < g_hi) return g_table[guest - g_lo];
+    if (guest >= g_lo && guest < g_hi) return reinterpret_cast<X86Func*>(reinterpret_cast<uintptr_t>(g_table[guest - g_lo]) & ~uintptr_t(1));
     return nullptr;
 }
 

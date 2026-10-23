@@ -158,12 +158,27 @@ std::string CodeGen::Target(uint32_t t) {
         labels_.insert(t);
         return Fmt("goto loc_%08X;", t);
     }
-    if (an_.functions.count(t)) return Fmt("{ X86_SAVE_FLAGS(); %s(ctx, base); return; }", FuncName(t).c_str());
-    return Fmt("{ X86_SAVE_FLAGS(); x86_icall(ctx, base, 0x%Xu); return; }", t);
+    // a tail call: the static x87 stack goes back to ctx first
+    if (an_.functions.count(t)) return Fmt("{ X86_SAVE_FLAGS(); %s%s(ctx, base); return; }", X87Out().c_str(), FuncName(t).c_str());
+    return Fmt("{ X86_SAVE_FLAGS(); %sx86_icall_fast(ctx, base, 0x%Xu); return; }", X87Out().c_str(), t);
 }
 
 std::string CodeGen::Cond(ZydisMnemonic m) {
-    if (pending_.valid) {
+    if (pending_.valid && pending_.is_float) {
+        // comiss/ucomiss set ZF,PF,CF = 1,1,1 unordered, 0,0,1 less, 1,0,0 equal, 0,0,0 greater; an ordered C++
+        // comparison is false on NaN, so each condition is written to be true or false on unordered as the flags are
+        switch (m) {
+            case ZYDIS_MNEMONIC_JB: case ZYDIS_MNEMONIC_SETB: case ZYDIS_MNEMONIC_CMOVB: return "!(fa >= fb)";
+            case ZYDIS_MNEMONIC_JNB: case ZYDIS_MNEMONIC_SETNB: case ZYDIS_MNEMONIC_CMOVNB: return "fa >= fb";
+            case ZYDIS_MNEMONIC_JBE: case ZYDIS_MNEMONIC_SETBE: case ZYDIS_MNEMONIC_CMOVBE: return "!(fa > fb)";
+            case ZYDIS_MNEMONIC_JNBE: case ZYDIS_MNEMONIC_SETNBE: case ZYDIS_MNEMONIC_CMOVNBE: return "fa > fb";
+            case ZYDIS_MNEMONIC_JZ: case ZYDIS_MNEMONIC_SETZ: case ZYDIS_MNEMONIC_CMOVZ: return "!(fa < fb || fa > fb)";
+            case ZYDIS_MNEMONIC_JNZ: case ZYDIS_MNEMONIC_SETNZ: case ZYDIS_MNEMONIC_CMOVNZ: return "(fa < fb || fa > fb)";
+            case ZYDIS_MNEMONIC_JP: case ZYDIS_MNEMONIC_SETP: case ZYDIS_MNEMONIC_CMOVP: return "__builtin_isunordered(fa, fb)";
+            case ZYDIS_MNEMONIC_JNP: case ZYDIS_MNEMONIC_SETNP: case ZYDIS_MNEMONIC_CMOVNP: return "!__builtin_isunordered(fa, fb)";
+            default: break;
+        }
+    } else if (pending_.valid) {
         unsigned w = pending_.bits;
         std::string U = "(" + CType(w) + ")", S = "(" + CType(w, true) + ")";
         std::string a = U + "ca", b = U + "cb", sa = S + "ca", sb = S + "cb";
@@ -229,17 +244,21 @@ void CodeGen::EmitInsn(uint32_t va, const ZydisDecodedInstruction& in, const Zyd
     auto m = in.mnemonic;
     uint32_t next = va + in.length;
 
-    // control flow first
+    // control flow first; calls, tail calls and returns write the static x87 stack back to ctx (X87Out), and a call
+    // reloads it after (X87In)
+    std::string xout = X87Out();
     switch (m) {
         case ZYDIS_MNEMONIC_CALL: {
             if (ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
                 uint32_t t = uint32_t(next + ops[0].imm.value.s);
                 if (t == next) {  // call $+5 only pushes eip
                     Line(Fmt("\tX86_PUSH32(0x%Xu);", next));
+                    pending_.valid = false;
+                    return;
                 } else if (an_.functions.count(t)) {
-                    Line(Fmt("\tX86_PUSH32(0x%Xu); %s(ctx, base);", next, FuncName(t).c_str()));
+                    Line(Fmt("\t%sX86_PUSH32(0x%Xu); %s(ctx, base);", xout.c_str(), next, FuncName(t).c_str()));
                 } else {
-                    Line(Fmt("\tX86_PUSH32(0x%Xu); x86_icall(ctx, base, 0x%Xu);", next, t));
+                    Line(Fmt("\t%sX86_PUSH32(0x%Xu); x86_icall_fast(ctx, base, 0x%Xu);", xout.c_str(), next, t));
                 }
             } else if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY && ops[0].mem.base == ZYDIS_REGISTER_NONE &&
                        ops[0].mem.index == ZYDIS_REGISTER_NONE && ops[0].mem.segment != ZYDIS_REGISTER_FS &&
@@ -247,11 +266,13 @@ void CodeGen::EmitInsn(uint32_t va, const ZydisDecodedInstruction& in, const Zyd
                        uint32_t(ops[0].mem.disp.value) < an_.img.kernel_thunk + 0x400) {
                 uint32_t slot = uint32_t(ops[0].mem.disp.value), ord = 0;
                 an_.img.Read32(slot, ord);
-                Line(Fmt("\tX86_PUSH32(0x%Xu); x86_kernel(ctx, base, %u);", next, ord & 0x7FFFFFFF));
+                Line(Fmt("\t%sX86_PUSH32(0x%Xu); x86_kernel(ctx, base, %u);", xout.c_str(), next, ord & 0x7FFFFFFF));
             } else {
                 std::string ea = ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY ? AddrExpr(ops[0]) : "";
-                Line(Fmt("\t{ uint32_t t = %s; X86_PUSH32(0x%Xu); x86_icall(ctx, base, t); }", Read(ops[0], ea).c_str(), next));
+                Line(Fmt("\t{ uint32_t t = %s; %sX86_PUSH32(0x%Xu); x86_icall_fast(ctx, base, t); }", Read(ops[0], ea).c_str(),
+                         xout.c_str(), next));
             }
+            if (x87_static_) Line("\t" + X87In(x87_.at(va).out));
             pending_.valid = false;
             return;
         }
@@ -271,7 +292,8 @@ void CodeGen::EmitInsn(uint32_t va, const ZydisDecodedInstruction& in, const Zyd
                         if (!done.insert(t).second) continue;
                         Line(Fmt("\tcase 0x%Xu: %s", t, Target(t).c_str()));
                     }
-                    Line(Fmt("\tdefault: { X86_SAVE_FLAGS(); x86_icall(ctx, base, %s); return; }", Read(ops[0], ea).c_str()));
+                    Line(Fmt("\tdefault: { X86_SAVE_FLAGS(); %sx86_icall_fast(ctx, base, %s); return; }", xout.c_str(),
+                             Read(ops[0], ea).c_str()));
                     Line("\t}");
                 } else if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY && ops[0].mem.base == ZYDIS_REGISTER_NONE &&
                            ops[0].mem.index == ZYDIS_REGISTER_NONE &&
@@ -279,9 +301,10 @@ void CodeGen::EmitInsn(uint32_t va, const ZydisDecodedInstruction& in, const Zyd
                            uint32_t(ops[0].mem.disp.value) < an_.img.kernel_thunk + 0x400) {
                     uint32_t ord = 0;
                     an_.img.Read32(uint32_t(ops[0].mem.disp.value), ord);
-                    Line(Fmt("\tx86_kernel(ctx, base, %u); return;", ord & 0x7FFFFFFF));
+                    Line(Fmt("\t%sx86_kernel(ctx, base, %u); return;", xout.c_str(), ord & 0x7FFFFFFF));
                 } else {
-                    Line(Fmt("\t{ uint32_t t = %s; X86_SAVE_FLAGS(); x86_icall(ctx, base, t); return; }", Read(ops[0], ea).c_str()));
+                    Line(Fmt("\t{ uint32_t t = %s; X86_SAVE_FLAGS(); %sx86_icall_fast(ctx, base, t); return; }", Read(ops[0], ea).c_str(),
+                             xout.c_str()));
                 }
             }
             pending_.valid = false;
@@ -289,7 +312,7 @@ void CodeGen::EmitInsn(uint32_t va, const ZydisDecodedInstruction& in, const Zyd
         }
         case ZYDIS_MNEMONIC_RET: {
             uint32_t n = in.operand_count_visible && ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE ? uint32_t(ops[0].imm.value.u) : 0;
-            Line(Fmt("\tctx.esp += %u; return;", 4 + n));
+            Line(Fmt("\t%sctx.esp += %u; return;", xout.c_str(), 4 + n));
             pending_.valid = false;
             return;
         }
@@ -313,10 +336,18 @@ void CodeGen::EmitInsn(uint32_t va, const ZydisDecodedInstruction& in, const Zyd
         return;
     }
 
+    size_t mark = body_.size();
     bool ok = EmitInteger(va, in, ops) || EmitString(va, in, ops) || EmitX87(va, in, ops) || EmitSse(va, in, ops) ||
               EmitMmx(va, in, ops);
     if (!ok) Unimpl(va, in, ops);
-    if (m == ZYDIS_MNEMONIC_CMP || m == ZYDIS_MNEMONIC_TEST) keep_pending = true;
+    if (x87_static_) {
+        X87Check(va, body_.substr(mark));
+        // a trap ends the game, but its report shows ctx: the static stack goes there first
+        std::string t = X87BeforeTraps(body_.substr(mark), xout);
+        body_.replace(mark, std::string::npos, t);
+    }
+    if (m == ZYDIS_MNEMONIC_CMP || m == ZYDIS_MNEMONIC_TEST || m == ZYDIS_MNEMONIC_COMISS || m == ZYDIS_MNEMONIC_UCOMISS)
+        keep_pending = true;
     else if (in.cpu_flags && !(in.cpu_flags->modified | in.cpu_flags->set_0 | in.cpu_flags->set_1 | in.cpu_flags->undefined))
         keep_pending = pending_.valid;
     if (!keep_pending) pending_.valid = false;

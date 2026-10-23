@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <mutex>
+#include <new>
 #include <vector>
 
 #include "core/log.h"
@@ -11,6 +13,8 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#elif defined(__SWITCH__)
+#include <switch.h>
 #else
 #include <sys/mman.h>
 #endif
@@ -21,6 +25,135 @@ static uint8_t* g_base = nullptr;
 static std::recursive_mutex g_lock;
 
 uint8_t* Base() { return g_base; }
+
+static bool g_wc_aliased = true;
+bool WriteCombineAliased() { return g_wc_aliased; }
+
+#ifdef __SWITCH__
+// Horizon gives homebrew no way to commit pages at an address of its choosing but aliases of its own heap. The one
+// used: svcMapProcessCodeMemory of a heap block at the guest address, made read-write by
+// svcSetProcessMemoryPermission (the libnx JIT's SetProcessMemoryPermission path). The pages are then in state
+// AliasCodeData (svcQueryMemory type 0x09), which the GPU can map (nvmap, deko3d memory blocks) and
+// svcMapProcessMemory can map again (the write combined view as a true alias). Code memory (svcCreateCodeMemory,
+// MapOwner), the fallback when the loader does not allow those calls, leaves state CodeOut, which allows neither.
+// svcMapPhysicalMemory needs a system resource homebrew does not have (0xFA01). Pages are mapped in 1 MB chunks, a
+// run of new chunks at once, and stay mapped. Every alias is made before any device map: the alias calls require
+// pages without attributes, and a device map marks them.
+// An SVC the loader does not allow ends the process on the console, so each is checked with envIsSyscallHinted.
+namespace {
+
+constexpr uint64_t kChunk = 1u << 20;
+constexpr uint64_t kGpuAlign = 4u << 20;  // the device map alignment the GPU probe proved (gpuprobe, variant 6)
+constexpr uint32_t kSvcCreateCodeMemory = 0x4B, kSvcControlCodeMemory = 0x4C, kSvcSetProcessMemoryPermission = 0x73,
+                   kSvcMapProcessMemory = 0x74, kSvcMapProcessCodeMemory = 0x77, kSvcUnmapProcessCodeMemory = 0x78;
+std::vector<bool> g_mapped(size_t((1ull << 32) / kChunk), false);
+bool g_process_alias = false;  // runs are process code memory aliases (else code memory owner views)
+bool g_code_memory = false;    // the loader allows code memory, the fallback
+
+// every mapped run, for Shutdown: the guest address, length, heap source and (code memory) its object
+struct Run {
+    uint64_t first;
+    size_t len;
+    void* src;
+    Handle code;
+    bool alias;
+};
+std::vector<Run> g_runs;
+bool g_wc_mirror = false;  // the write combined view is svcMapProcessMemory of the contiguous one
+
+bool MapRun(uint64_t first, uint64_t end) {
+    size_t len = size_t(end - first);
+    // a 4 MB aligned run gets a 4 MB aligned source, so the GPU can map it (the contiguous view)
+    size_t align = (first % kGpuAlign == 0 && len % kGpuAlign == 0) ? kGpuAlign : 0x1000;
+    void* src = aligned_alloc(align, len);
+    Result rc = MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
+    Handle code = 0;
+    // heap pages an earlier program in this process left locked (a service's device mapping, the loader reuses the
+    // heap) refuse an alias as an invalid memory state: those stay allocated, never handed out again, and another
+    // block is tried
+    bool locked = false;  // src is such a block: never freed
+    for (int tries = 1; src && g_process_alias; tries++) {
+        rc = svcMapProcessCodeMemory(envGetOwnProcessHandle(), u64(g_base + first), u64(src), len);
+        locked = R_VALUE(rc) == KERNELRESULT(InvalidMemoryState);
+        if (!locked) break;
+        // the block's first page not plain heap names the holder (device: a service's mapping; attr locked: a
+        // mirror or transfer memory)
+        for (uint64_t at = u64(src), stop = u64(src) + len; at < stop;) {
+            MemoryInfo mi{};
+            u32 pi = 0;
+            if (R_FAILED(svcQueryMemory(&mi, &pi, at)) || !mi.size) break;
+            if (mi.type != MemType_Heap || mi.attr || mi.perm != Perm_Rw || mi.ipc_refcount || mi.device_refcount) {
+                LOGW("memory: heap block %p+%zX holds %llX+%llX type %X attr %X perm %X ipc %u device %u, set aside", src,
+                     len, (unsigned long long)mi.addr, (unsigned long long)mi.size, mi.type, mi.attr, mi.perm,
+                     mi.ipc_refcount, mi.device_refcount);
+                break;
+            }
+            at = mi.addr + mi.size;
+        }
+        void* next = tries < 64 ? aligned_alloc(align, len) : nullptr;
+        if (!next) break;  // src stays the last locked block, rc its refusal
+        src = next;
+    }
+    if (src && g_process_alias && R_SUCCEEDED(rc)) {
+        Handle self = envGetOwnProcessHandle();
+        rc = svcSetProcessMemoryPermission(self, u64(g_base + first), len, Perm_Rw);
+        // an alias left in place keeps its source locked: the source is then leaked, never freed
+        if (R_FAILED(rc) && R_FAILED(svcUnmapProcessCodeMemory(self, u64(g_base + first), u64(src), len))) {
+            LOGE("memory: alias of %llX+%zX left read only (%X)", (unsigned long long)first, len, rc);
+            return false;
+        }
+    }
+    if (src && g_process_alias && R_FAILED(rc) && R_VALUE(rc) != KERNELRESULT(InvalidMemoryState)) {
+        // refused (Ryujinx answers svc 0x77 with 0xE401): code memory from here on, the view then CPU only
+        LOGW("memory: process code memory alias of %llX+%zX refused (%X), code memory instead",
+             (unsigned long long)first, len, rc);
+        g_process_alias = false;
+    }
+    if (src && !g_process_alias && g_code_memory && R_FAILED(rc)) {
+        rc = svcCreateCodeMemory(&code, src, len);
+        if (R_SUCCEEDED(rc)) rc = svcControlCodeMemory(code, CodeMapOperation_MapOwner, g_base + first, len, Perm_Rw);
+    }
+    if (R_FAILED(rc)) {
+        LOGE("memory: mapping %llX+%zX failed (%X)", (unsigned long long)first, len, rc);
+        // the source's pages as the kernel sees them: an earlier program's device mapping (audio, GPU) or alias over
+        // this heap shows as their state and attributes
+        for (uint64_t at = u64(src), stop = u64(src) + len; src && at < stop;) {
+            MemoryInfo mi{};
+            u32 pi = 0;
+            if (R_FAILED(svcQueryMemory(&mi, &pi, at)) || !mi.size) break;
+            LOGE("memory:   source %llX+%llX type %X attr %X perm %X ipc %u device %u", (unsigned long long)mi.addr,
+                 (unsigned long long)mi.size, mi.type, mi.attr, mi.perm, mi.ipc_refcount, mi.device_refcount);
+            at = mi.addr + mi.size;
+        }
+        if (code) svcCloseHandle(code);
+        if (!locked) std::free(src);
+        return false;
+    }
+    std::memset(g_base + first, 0, len);
+    g_runs.push_back({first, len, src, code, g_process_alias});
+    for (uint64_t c = first; c < end; c += kChunk) g_mapped[size_t(c / kChunk)] = true;
+    return true;
+}
+
+// maps the chunks of [first, end) not mapped yet
+bool MapChunks(uint64_t first, uint64_t end) {
+    first &= ~(kChunk - 1);
+    end = (end + kChunk - 1) & ~(kChunk - 1);
+    for (uint64_t c = first; c < end;) {
+        if (g_mapped[size_t(c / kChunk)]) {
+            c += kChunk;
+            continue;
+        }
+        uint64_t run = c;
+        while (run < end && !g_mapped[size_t(run / kChunk)]) run += kChunk;
+        if (!MapRun(c, run)) return false;
+        c = run;
+    }
+    return true;
+}
+
+}  // namespace
+#endif
 
 // physical memory shows at 0x80000000 and again at 0xF0000000 (write combined view)
 static bool InPhysical(uint32_t va) {
@@ -54,6 +187,41 @@ bool Init() {
         UnmapViewOfFile(b + kContiguousBase);
         UnmapViewOfFile(b + kWriteCombineBase);
     }
+#elif defined(__SWITCH__)
+    // Horizon: 4 GB of the address space, 4 MB aligned, mapped by MapChunks as the guest commits
+    // process code memory aliases need the own process handle and svc 0x73, 0x77 and 0x78 (to undo a half made
+    // alias); code memory (0x4B, 0x4C) is the fallback, also when the first alias is refused (MapRun)
+    g_process_alias = envGetOwnProcessHandle() != INVALID_HANDLE && envIsSyscallHinted(kSvcMapProcessCodeMemory) &&
+                      envIsSyscallHinted(kSvcSetProcessMemoryPermission) && envIsSyscallHinted(kSvcUnmapProcessCodeMemory);
+    g_code_memory = envIsSyscallHinted(kSvcCreateCodeMemory) && envIsSyscallHinted(kSvcControlCodeMemory);
+    if (!g_process_alias && !g_code_memory) {
+        LOGE("memory: the loader allows neither process code memory (svc 0x73, 0x77, 0x78) nor code memory (0x4B, 0x4C)");
+        return false;
+    }
+    virtmemLock();
+    void* at = virtmemFindAslr(size + kGpuAlign, 0x10000);
+    uint8_t* aligned = at ? reinterpret_cast<uint8_t*>((uintptr_t(at) + kGpuAlign - 1) & ~uintptr_t(kGpuAlign - 1)) : nullptr;
+    if (at && virtmemAddReservation(at, size + kGpuAlign)) g_base = aligned;
+    virtmemUnlock();
+    LOGI("memory: guest RAM by %s", g_process_alias ? "process code memory aliases (GPU mappable)" : "code memory (CPU only)");
+    if (g_base && !MapChunks(kContiguousBase, kContiguousBase + kPhysicalSize)) g_base = nullptr;
+    // the write combined view: the same pages through svcMapProcessMemory on this process (possible over process code
+    // memory aliases, not over code memory), else pages of its own; only the XMV film decoder writes through it
+    if (g_base) {
+        Result rc = MAKERESULT(Module_Libnx, LibnxError_NotFound);
+        if (envIsSyscallHinted(kSvcMapProcessMemory))
+            rc = svcMapProcessMemory(g_base + kWriteCombineBase, envGetOwnProcessHandle(),
+                                     reinterpret_cast<u64>(g_base + kContiguousBase), kPhysicalSize);
+        if (R_SUCCEEDED(rc)) {
+            for (uint64_t c = kWriteCombineBase; c < kWriteCombineBase + kPhysicalSize; c += kChunk)
+                g_mapped[size_t(c / kChunk)] = true;
+        } else if (!MapChunks(kWriteCombineBase, kWriteCombineBase + kPhysicalSize)) {
+            g_base = nullptr;
+        }
+        g_wc_aliased = R_SUCCEEDED(rc);
+        g_wc_mirror = R_SUCCEEDED(rc);
+        LOGI("memory: write combined view %s", R_SUCCEEDED(rc) ? "aliased" : "separate");
+    }
 #else
     void* p = mmap(reinterpret_cast<void*>(0x100000000ull), size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     g_base = p == MAP_FAILED ? nullptr : static_cast<uint8_t*>(p);
@@ -84,6 +252,11 @@ bool Commit(uint32_t va, uint32_t size) {
         LOGE("memory: commit %08X+%X failed", first, uint32_t(end - first));
         return false;
     }
+#elif defined(__SWITCH__)
+    if (!MapChunks(first, end)) {
+        LOGE("memory: commit %08X+%X failed", first, uint32_t(end - first));
+        return false;
+    }
 #else
     if (mprotect(g_base + first, size_t(end - first), PROT_READ | PROT_WRITE)) {
         LOGE("memory: commit %08X+%X failed", first, uint32_t(end - first));
@@ -101,6 +274,9 @@ void Decommit(uint32_t va, uint32_t size) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
 #ifdef _WIN32
     VirtualFree(g_base + first, size_t(end - first), MEM_DECOMMIT);
+#elif defined(__SWITCH__)
+    // the chunks stay mapped: the pages read as zero, as decommitted memory does once committed again
+    std::memset(g_base + first, 0, size_t(end - first));
 #else
     madvise(g_base + first, size_t(end - first), MADV_DONTNEED);
     mprotect(g_base + first, size_t(end - first), PROT_NONE);
@@ -109,6 +285,59 @@ void Decommit(uint32_t va, uint32_t size) {
 }
 
 bool IsCommitted(uint32_t va) { return InPhysical(va) || g_committed[va >> 12] != 0; }
+
+#ifdef __SWITCH__
+alignas(0x1000) static uint8_t g_bounce[256 * 1024];
+static std::mutex g_bounce_lock;
+
+Bounce LockBounce() {
+    g_bounce_lock.lock();
+    return {g_bounce, sizeof g_bounce};
+}
+void UnlockBounce() { g_bounce_lock.unlock(); }
+
+// each thread's own, so one thread's long read does not hold up another's (the audio streams read while a level
+// loads); made on a thread's first transfer, on the heap, which the fs service takes
+constexpr size_t kThreadBounce = 256 * 1024;
+static uint8_t* ThreadBounce() {
+    thread_local std::unique_ptr<uint8_t[]> buffer;
+    if (!buffer) buffer.reset(new (std::nothrow) uint8_t[kThreadBounce]);
+    return buffer.get();
+}
+
+size_t FileRead(void* dst, size_t size, std::FILE* f) {
+    uint8_t* bounce = ThreadBounce();
+    if (!bounce) return 0;
+    size_t done = 0;
+    while (done < size) {
+        size_t want = std::min(size - done, kThreadBounce);
+        size_t got = std::fread(bounce, 1, want, f);
+        std::memcpy(static_cast<uint8_t*>(dst) + done, bounce, got);
+        done += got;
+        if (got < want) break;
+    }
+    return done;
+}
+
+size_t FileWrite(const void* src, size_t size, std::FILE* f) {
+    uint8_t* bounce = ThreadBounce();
+    if (!bounce) return 0;
+    size_t done = 0;
+    while (done < size) {
+        size_t want = std::min(size - done, kThreadBounce);
+        std::memcpy(bounce, static_cast<const uint8_t*>(src) + done, want);
+        size_t put = std::fwrite(bounce, 1, want, f);
+        done += put;
+        if (put < want) break;
+    }
+    return done;
+}
+#else
+Bounce LockBounce() { return {nullptr, 0}; }
+void UnlockBounce() {}
+size_t FileRead(void* dst, size_t size, std::FILE* f) { return std::fread(dst, 1, size, f); }
+size_t FileWrite(const void* src, size_t size, std::FILE* f) { return std::fwrite(src, 1, size, f); }
+#endif
 
 // first fit allocator over a guest range
 class Ranges {
@@ -437,5 +666,61 @@ Stats Query() {
     s.available_pages = used >= s.total_pages ? 0 : uint32_t(s.total_pages - used);
     return s;
 }
+
+
+
+}  // namespace mem
+
+namespace mem {
+
+GuestRam GuestRamForGpu() {
+    GuestRam r{g_base ? g_base + kContiguousBase : nullptr, kPhysicalSize, false};
+#ifdef __SWITCH__
+    // a GPU memory block over pages nvmap refuses ends the process (deko3d aborts whatever its callback does):
+    // the view must be one process code memory alias, state AliasCodeData (type 0x09), from its first page to its last
+    if (r.ptr && g_process_alias) {
+        MemoryInfo first{}, last{};
+        u32 page = 0;
+        bool ok = R_SUCCEEDED(svcQueryMemory(&first, &page, u64(r.ptr))) &&
+                  R_SUCCEEDED(svcQueryMemory(&last, &page, u64(r.ptr) + kPhysicalSize - 1));
+        r.gpu_mappable = ok && (first.type & 0xFF) == MemType_ModuleCodeMutable && (last.type & 0xFF) == MemType_ModuleCodeMutable &&
+                         first.addr <= u64(r.ptr) && last.addr + last.size >= u64(r.ptr) + kPhysicalSize;
+        if (!r.gpu_mappable)
+            LOGW("memory: guest RAM is not GPU mappable (type %X..%X at %p)", first.type & 0xFF, last.type & 0xFF, r.ptr);
+    }
+#endif
+    return r;
+}
+
+#ifdef __SWITCH__
+// Unmaps the guest space for a return to the loader (the clean exit, switch/headless/clean_exit.cpp): the loader
+// reuses this process and its heap for the next program, and heap pages under an alias are locked. Every thread
+// that touches guest memory is paused, and the GPU's mappings are gone (the device closed), before this runs.
+// Each call is one the loader allows (envIsSyscallHinted): any other ends the process.
+bool Shutdown() {
+    if (!g_base) return true;
+    const Handle self = envGetOwnProcessHandle();
+    bool ok = true;
+    if (g_wc_mirror) {
+        ok = envIsSyscallHinted(0x75) && R_SUCCEEDED(svcUnmapProcessMemory(g_base + kWriteCombineBase, self,
+                                                                         u64(g_base + kContiguousBase), kPhysicalSize));
+        g_wc_mirror = false;
+    }
+    for (auto r = g_runs.rbegin(); r != g_runs.rend(); ++r) {
+        Result rc;
+        if (r->alias)
+            rc = envIsSyscallHinted(0x78) ? svcUnmapProcessCodeMemory(self, u64(g_base + r->first), u64(r->src), r->len)
+                                          : MAKERESULT(Module_Libnx, LibnxError_NotFound);
+        else {
+            rc = svcControlCodeMemory(r->code, CodeMapOperation_UnmapOwner, g_base + r->first, r->len, Perm_None);
+            if (R_SUCCEEDED(rc)) svcCloseHandle(r->code);
+        }
+        ok = ok && R_SUCCEEDED(rc);
+    }
+    g_runs.clear();
+    g_base = nullptr;  // the 4 GB reservation is this program's libnx bookkeeping, gone with it
+    return ok;
+}
+#endif
 
 }  // namespace mem

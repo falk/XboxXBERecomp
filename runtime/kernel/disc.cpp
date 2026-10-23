@@ -1,4 +1,5 @@
 #include "kernel/disc.h"
+#include "kernel/memory.h"
 
 #include <algorithm>
 #include <cctype>
@@ -70,6 +71,23 @@ uint32_t Disc::ReadAt(uint64_t at, void* out, uint32_t len) const {
     if (!ReadFile(HANDLE(file_), out, len, nullptr, &o) && GetLastError() != ERROR_IO_PENDING) return 0;
     if (!GetOverlappedResult(HANDLE(file_), &o, &got, TRUE)) return 0;
     return got;
+#elif defined(__SWITCH__)
+    // libnx has no pread: one position for every reader, through the host buffer (out may be guest memory, which
+    // the fs service does not take, see mem::FileRead)
+    mem::Bounce b = mem::LockBounce();
+    uint32_t done = 0;
+    if (lseek(int(file_), off_t(at), SEEK_SET) >= 0) {
+        while (done < len) {
+            size_t want = std::min<size_t>(len - done, b.size);
+            ssize_t got = read(int(file_), b.data, want);
+            if (got <= 0) break;
+            std::memcpy(static_cast<uint8_t*>(out) + done, b.data, size_t(got));
+            done += uint32_t(got);
+            if (size_t(got) < want) break;
+        }
+    }
+    mem::UnlockBounce();
+    return done;
 #else
     ssize_t got = pread(int(file_), out, len, off_t(at));
     return got > 0 ? uint32_t(got) : 0;
